@@ -43,12 +43,13 @@ public class BotAccessibilityService extends AccessibilityService {
     private boolean isRunning = false;
     private final Handler handler = new Handler(Looper.getMainLooper());
 
-    // Точная калибровка по видео:
-    // 1) При касании фигура подскакивает вверх на 3.10 клетки
-    // 2) По вертикали коэффициент смещения 1.12, по горизонтали (для боковых слотов) — 1.35
-    private float liftCells = 3.10f;
-    private float dragScaleY = 1.12f;
-    private float dragScaleX = 1.35f;
+    // Точные коэффициенты, вычисленные по видео с точкой касания:
+    // 1) При касании слота фигура подскакивает вверх на 2.48 клетки
+    // 2) По горизонтали фигура движется в 1.50 раза быстрее пальца
+    // 3) По вертикали фигура движется в 1.65 раза быстрее пальца
+    private float liftCells = 2.48f;
+    private float dragScaleX = 1.50f;
+    private float dragScaleY = 1.65f;
 
     @Override
     protected void onServiceConnected() {
@@ -104,15 +105,15 @@ public class BotAccessibilityService extends AccessibilityService {
         Button b = new Button(this);
         b.setText(label);
         b.setTextColor(Color.WHITE);
-        b.setTextSize(12);
-        b.setPadding(18, 8, 18, 8);
+        b.setTextSize(11);
+        b.setPadding(16, 6, 16, 6);
         b.setMinimumWidth(0);
         b.setMinWidth(0);
         b.setBackgroundColor(bgColor);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT);
-        lp.setMargins(6, 0, 6, 0);
+        lp.setMargins(5, 0, 5, 0);
         b.setLayoutParams(lp);
         return b;
     }
@@ -123,7 +124,7 @@ public class BotAccessibilityService extends AccessibilityService {
         overlayView = new LinearLayout(this);
         overlayView.setOrientation(LinearLayout.HORIZONTAL);
         overlayView.setBackgroundColor(Color.argb(220, 20, 25, 45));
-        overlayView.setPadding(12, 8, 12, 8);
+        overlayView.setPadding(10, 8, 10, 8);
         overlayView.setGravity(Gravity.CENTER_VERTICAL);
 
         toggleBtn = makeSmallBtn("СТАРТ", Color.parseColor("#2E7D32"));
@@ -137,28 +138,28 @@ public class BotAccessibilityService extends AccessibilityService {
 
         Button btnYMinus = makeSmallBtn("Y-", Color.parseColor("#455A64"));
         btnYMinus.setOnClickListener(v -> {
-            liftCells -= 0.12f;
+            liftCells -= 0.10f;
             statusText.setText(String.format("Y:%.2f", liftCells));
         });
         overlayView.addView(btnYMinus);
 
         Button btnYPlus = makeSmallBtn("Y+", Color.parseColor("#455A64"));
         btnYPlus.setOnClickListener(v -> {
-            liftCells += 0.12f;
+            liftCells += 0.10f;
             statusText.setText(String.format("Y:%.2f", liftCells));
         });
         overlayView.addView(btnYPlus);
 
         Button btnXMinus = makeSmallBtn("X-", Color.parseColor("#37474F"));
         btnXMinus.setOnClickListener(v -> {
-            dragScaleX -= 0.05f;
+            dragScaleX -= 0.04f;
             statusText.setText(String.format("X:%.2f", dragScaleX));
         });
         overlayView.addView(btnXMinus);
 
         Button btnXPlus = makeSmallBtn("X+", Color.parseColor("#37474F"));
         btnXPlus.setOnClickListener(v -> {
-            dragScaleX += 0.05f;
+            dragScaleX += 0.04f;
             statusText.setText(String.format("X:%.2f", dragScaleX));
         });
         overlayView.addView(btnXPlus);
@@ -170,7 +171,6 @@ public class BotAccessibilityService extends AccessibilityService {
         statusText.setPadding(8, 0, 8, 0);
         overlayView.addView(statusText);
 
-        // Кнопка ЗАКРЫТЬ (X)
         Button btnClose = makeSmallBtn("✕", Color.parseColor("#B71C1C"));
         btnClose.setOnClickListener(v -> closeOverlayAndStop());
         overlayView.addView(btnClose);
@@ -203,17 +203,25 @@ public class BotAccessibilityService extends AccessibilityService {
             float cellSize = gridWidth / 8.0f;
             float gridTop = screenH * 0.232f;
 
+            // Считываем поле 8x8 по нескольким точкам внутри каждой клетки
             int[][] board = new int[8][8];
             for (int r = 0; r < 8; r++) {
                 for (int c = 0; c < 8; c++) {
-                    int px = (int) (gridLeft + (c + 0.5f) * cellSize);
-                    int py = (int) (gridTop + (r + 0.5f) * cellSize);
-                    board[r][c] = isFilledBoardCell(bmp.getPixel(px, py)) ? 1 : 0;
+                    int cx = (int) (gridLeft + (c + 0.5f) * cellSize);
+                    int cy = (int) (gridTop + (r + 0.5f) * cellSize);
+                    int filledVotes = 0;
+                    int offset = (int) (cellSize * 0.18f);
+                    if (isFilledBoardCell(bmp.getPixel(cx, cy))) filledVotes++;
+                    if (isFilledBoardCell(bmp.getPixel(cx - offset, cy))) filledVotes++;
+                    if (isFilledBoardCell(bmp.getPixel(cx + offset, cy))) filledVotes++;
+                    if (isFilledBoardCell(bmp.getPixel(cx, cy - offset))) filledVotes++;
+                    if (isFilledBoardCell(bmp.getPixel(cx, cy + offset))) filledVotes++;
+                    board[r][c] = (filledVotes >= 3) ? 1 : 0;
                 }
             }
 
             float[] slotX = { screenW * 0.208f, screenW * 0.500f, screenW * 0.792f };
-            float slotY = screenH * 0.753f;
+            float slotY = screenH * 0.754f;
             float dockStep = screenW * 0.050f;
 
             int bgSample = bmp.getPixel((int) (screenW * 0.5f), (int) (screenH * 0.675f));
@@ -242,66 +250,60 @@ public class BotAccessibilityService extends AccessibilityService {
                     " (" + bestMove.piece.rows + "x" + bestMove.piece.cols + ")" +
                     "->[" + (bestMove.row + 1) + "," + (bestMove.col + 1) + "]");
 
-            // Центр целевой позиции фигуры на сетке 8x8
+            // Центр целевой области на сетке 8x8
             float targetCenterX = gridLeft + (bestMove.col + bestMove.piece.cols / 2.0f) * cellSize;
             float targetCenterY = gridTop + (bestMove.row + bestMove.piece.rows / 2.0f) * cellSize;
 
-            // Начинаем захват из фактического центра фигуры в слоте
+            // Точка старта пальца — центр фигуры в слоте
             float startX = bestMove.piece.centerX;
             float startY = bestMove.piece.centerY;
 
-            // Учитываем стартовый подскок фигуры вверх (liftCells) и разные коэффициенты по осям X и Y
+            // Точный расчет конечной точки пальца по формуле из видео
             float liftPx = liftCells * cellSize;
             float endX = startX + (targetCenterX - startX) / dragScaleX;
             float endY = startY + (targetCenterY - (startY - liftPx)) / dragScaleY;
 
-            performDragWithHold(startX, startY, endX, endY, () -> {
-                if (isRunning) handler.postDelayed(botLoop, 650);
+            // Проверяем, сгорит ли линия после этого хода (нужна ли пауза под анимацию Combo/+10)
+            boolean clearsLine = willClearLine(board, bestMove.piece, bestMove.row, bestMove.col);
+            long nextDelay = clearsLine ? 1250L : 650L;
+
+            performSmoothDrag(startX, startY, endX, endY, () -> {
+                if (isRunning) handler.postDelayed(botLoop, nextDelay);
             });
         }
     };
 
-    // Свайп + фиксация пальца в конечной точке на 130 мс, чтобы фигура долетела по инерции и встала в клетку
-    private void performDragWithHold(float sx, float sy, float ex, float ey, Runnable onDone) {
+    // Единый непрерывный жест без continueStroke (не вызывает ACTION_CANCEL на HyperOS/MIUI)
+    // В конце пути делает микро-удержание в целевой точке, чтобы фигура встала в сетку перед отпусканием
+    private void performSmoothDrag(float sx, float sy, float ex, float ey, Runnable onDone) {
         ex = Math.max(25, Math.min(screenW - 25, ex));
         ey = Math.max(25, Math.min(screenH - 25, ey));
 
-        final float finalEx = ex;
-        final float finalEy = ey;
+        Path path = new Path();
+        path.moveTo(sx, sy);
 
-        Path movePath = new Path();
-        movePath.moveTo(sx, sy);
-        movePath.lineTo(finalEx, finalEy);
+        // Плавно подводим к цели (92% пути) и мягко доводим до точной координаты
+        float midX = sx + (ex - sx) * 0.92f;
+        float midY = sy + (ey - sy) * 0.92f;
+        path.lineTo(midX, midY);
+        path.lineTo(ex, ey);
 
-        GestureDescription.StrokeDescription moveStroke =
-                new GestureDescription.StrokeDescription(movePath, 0, 360, true);
+        // Микро-фиксация пальца на месте (1.5 px), чтобы погасить инерцию фигуры перед ACTION_UP
+        path.lineTo(ex + 1.5f, ey);
+        path.lineTo(ex - 1.5f, ey);
+        path.lineTo(ex, ey + 1.5f);
+        path.lineTo(ex, ey);
+
+        GestureDescription.StrokeDescription stroke =
+                new GestureDescription.StrokeDescription(path, 0, 520);
 
         GestureDescription.Builder builder = new GestureDescription.Builder();
-        builder.addStroke(moveStroke);
+        builder.addStroke(stroke);
 
         dispatchGesture(builder.build(), new GestureResultCallback() {
             @Override
             public void onCompleted(GestureDescription gestureDescription) {
-                Path holdPath = new Path();
-                holdPath.moveTo(finalEx, finalEy);
-                holdPath.lineTo(finalEx + 0.5f, finalEy + 0.5f);
-
-                GestureDescription.StrokeDescription holdStroke =
-                        moveStroke.continueStroke(holdPath, 0, 130, false);
-
-                GestureDescription.Builder holdBuilder = new GestureDescription.Builder();
-                holdBuilder.addStroke(holdStroke);
-
-                dispatchGesture(holdBuilder.build(), new GestureResultCallback() {
-                    @Override
-                    public void onCompleted(GestureDescription gd) {
-                        onDone.run();
-                    }
-                    @Override
-                    public void onCancelled(GestureDescription gd) {
-                        onDone.run();
-                    }
-                }, null);
+                onDone.run();
             }
 
             @Override
@@ -326,7 +328,7 @@ public class BotAccessibilityService extends AccessibilityService {
         float[] hsv = new float[3];
         Color.colorToHSV(color, hsv);
 
-        return diff > 48 && (hsv[1] > 0.48f || hsv[2] > 0.65f);
+        return diff > 45 && (hsv[1] > 0.45f || hsv[2] > 0.62f);
     }
 
     private Piece parsePiece(Bitmap bmp, float cx, float cy, float step, int bgColor, int slotIdx) {
@@ -335,8 +337,9 @@ public class BotAccessibilityService extends AccessibilityService {
         int minY = Integer.MAX_VALUE, maxY = Integer.MIN_VALUE;
         int count = 0;
 
-        for (int y = (int) cy - halfW; y <= (int) cy + halfW; y += 3) {
-            for (int x = (int) cx - halfW; x <= (int) cx + halfW; x += 3) {
+        // Шаг 2 пикселя для точного захвата даже одиночных кубиков 1x1 и диагоналей
+        for (int y = (int) cy - halfW; y <= (int) cy + halfW; y += 2) {
+            for (int x = (int) cx - halfW; x <= (int) cx + halfW; x += 2) {
                 if (x < 0 || x >= screenW || y < 0 || y >= screenH) continue;
                 if (isPiecePixel(bmp.getPixel(x, y), bgColor)) {
                     if (x < minX) minX = x;
@@ -347,10 +350,10 @@ public class BotAccessibilityService extends AccessibilityService {
                 }
             }
         }
-        if (count < 14) return null;
+        if (count < 16) return null;
 
-        int cols = Math.max(1, Math.min(5, Math.round((maxX - minX) / step)));
-        int rows = Math.max(1, Math.min(5, Math.round((maxY - minY) / step)));
+        int cols = Math.max(1, Math.min(5, Math.round((maxX - minX) / step + 0.12f)));
+        int rows = Math.max(1, Math.min(5, Math.round((maxY - minY) / step + 0.12f)));
 
         int[][] shape = new int[rows][cols];
         float boxW = (float) (maxX - minX) / cols;
@@ -369,7 +372,7 @@ public class BotAccessibilityService extends AccessibilityService {
                         if (isPiecePixel(bmp.getPixel(px, py), bgColor)) hits++;
                     }
                 }
-                if (hits >= 7) {
+                if (hits >= 6) {
                     shape[r][c] = 1;
                     filledBlocks++;
                 }
@@ -385,6 +388,27 @@ public class BotAccessibilityService extends AccessibilityService {
         p.centerX = (minX + maxX) / 2.0f;
         p.centerY = (minY + maxY) / 2.0f;
         return p;
+    }
+
+    private boolean willClearLine(int[][] board, Piece p, int row, int col) {
+        int[][] next = new int[8][8];
+        for (int r = 0; r < 8; r++) System.arraycopy(board[r], 0, next[r], 0, 8);
+        for (int r = 0; r < p.rows; r++) {
+            for (int c = 0; c < p.cols; c++) {
+                if (p.shape[r][c] == 1) next[row + r][col + c] = 1;
+            }
+        }
+        for (int r = 0; r < 8; r++) {
+            boolean full = true;
+            for (int c = 0; c < 8; c++) if (next[r][c] == 0) full = false;
+            if (full) return true;
+        }
+        for (int c = 0; c < 8; c++) {
+            boolean full = true;
+            for (int r = 0; r < 8; r++) if (next[r][c] == 0) full = false;
+            if (full) return true;
+        }
+        return false;
     }
 
     private Move findBestMoveForAllPieces(int[][] board, List<Piece> pieces) {
