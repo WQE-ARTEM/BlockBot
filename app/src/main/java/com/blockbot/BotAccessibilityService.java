@@ -34,11 +34,9 @@ import org.json.JSONObject;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
-import java.net.HttpURLConnection;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.net.URL;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -52,7 +50,7 @@ public class BotAccessibilityService extends AccessibilityService {
     private SightOverlayView sightView;
     private TextView statusText;
     private Button toggleBtn;
-    private Button modeBtn;
+    private Button speedBtn;
 
     private MediaProjection projection;
     private ImageReader imageReader;
@@ -64,16 +62,16 @@ public class BotAccessibilityService extends AccessibilityService {
     private SharedPreferences prefs;
     private ServerSocket localServer;
 
-    // Параметры управления (обновляются без переустановки через Termux 127.0.0.1:8765 или GitHub)
-    private float baseLiftCells = 1.98f;
-    private float rowHeightLiftFactor = 0.50f;
+    // Точные параметры с плавным ведением и полной остановкой пальца перед сбросом
+    private float baseLiftCells = 2.38f;
+    private float rowHeightLiftFactor = 0.16f;
     private float dragScaleX = 1.48f;
-    private float dragScaleY = 1.26f;
-    private boolean trackAndSteer = true;
-    private boolean autoLearnRows = true;
-    private int swipeDurationMs = 540;
+    private float dragScaleY = 1.28f;
+    private boolean autoLearnRows = false;
+    private int dragDurationMs = 650;  // Время плавного ведения фигуры
+    private int holdDurationMs = 380;  // Время полной остановки пальца на месте перед отпусканием
+    private boolean useTwoStageHold = true;
 
-    // Индивидуальные поправки для каждого из 8 рядов и 8 столбцов (в клетках поля)
     private final float[] rowBiasCells = new float[8];
     private final float[] colBiasCells = new float[8];
 
@@ -86,7 +84,7 @@ public class BotAccessibilityService extends AccessibilityService {
         screenW = dm.widthPixels;
         screenH = dm.heightPixels;
         screenDensity = dm.densityDpi;
-        prefs = getSharedPreferences("blockbot_cfg", Context.MODE_PRIVATE);
+        prefs = getSharedPreferences("blockbot_cfg_v3", Context.MODE_PRIVATE);
         loadSavedConfig();
         startLocalHotUpdateServer();
     }
@@ -104,9 +102,10 @@ public class BotAccessibilityService extends AccessibilityService {
             if (obj.has("rowHeightLiftFactor")) rowHeightLiftFactor = (float) obj.getDouble("rowHeightLiftFactor");
             if (obj.has("dragScaleX")) dragScaleX = (float) obj.getDouble("dragScaleX");
             if (obj.has("dragScaleY")) dragScaleY = (float) obj.getDouble("dragScaleY");
-            if (obj.has("trackAndSteer")) trackAndSteer = obj.getBoolean("trackAndSteer");
             if (obj.has("autoLearnRows")) autoLearnRows = obj.getBoolean("autoLearnRows");
-            if (obj.has("swipeDurationMs")) swipeDurationMs = obj.getInt("swipeDurationMs");
+            if (obj.has("dragDurationMs")) dragDurationMs = obj.getInt("dragDurationMs");
+            if (obj.has("holdDurationMs")) holdDurationMs = obj.getInt("holdDurationMs");
+            if (obj.has("useTwoStageHold")) useTwoStageHold = obj.getBoolean("useTwoStageHold");
             if (obj.has("resetBias") && obj.getBoolean("resetBias")) {
                 for (int i = 0; i < 8; i++) { rowBiasCells[i] = 0f; colBiasCells[i] = 0f; }
             }
@@ -120,8 +119,7 @@ public class BotAccessibilityService extends AccessibilityService {
             }
             if (save) saveCurrentConfig();
             handler.post(() -> {
-                if (statusText != null) statusText.setText(String.format("Обновлено! Y:%.2f", dragScaleY));
-                if (modeBtn != null) modeBtn.setText(trackAndSteer ? "СЛЕД:ВКЛ" : "СЛЕД:АВТО");
+                if (statusText != null) statusText.setText("CFG OK!");
             });
         } catch (Exception ignored) {}
     }
@@ -133,9 +131,10 @@ public class BotAccessibilityService extends AccessibilityService {
             obj.put("rowHeightLiftFactor", rowHeightLiftFactor);
             obj.put("dragScaleX", dragScaleX);
             obj.put("dragScaleY", dragScaleY);
-            obj.put("trackAndSteer", trackAndSteer);
             obj.put("autoLearnRows", autoLearnRows);
-            obj.put("swipeDurationMs", swipeDurationMs);
+            obj.put("dragDurationMs", dragDurationMs);
+            obj.put("holdDurationMs", holdDurationMs);
+            obj.put("useTwoStageHold", useTwoStageHold);
             JSONArray rArr = new JSONArray();
             JSONArray cArr = new JSONArray();
             for (int i = 0; i < 8; i++) {
@@ -148,7 +147,6 @@ public class BotAccessibilityService extends AccessibilityService {
         } catch (Exception ignored) {}
     }
 
-    // Локальный сервер 127.0.0.1:8765 для мгновенного обновления настроек из Termux без переустановки APK
     private void startLocalHotUpdateServer() {
         new Thread(() -> {
             try {
@@ -278,38 +276,39 @@ public class BotAccessibilityService extends AccessibilityService {
         });
         overlayView.addView(toggleBtn);
 
-        modeBtn = makeSmallBtn(trackAndSteer ? "СЛЕД:ВКЛ" : "СЛЕД:АВТО", Color.parseColor("#1565C0"));
-        modeBtn.setOnClickListener(v -> {
-            trackAndSteer = !trackAndSteer;
-            modeBtn.setText(trackAndSteer ? "СЛЕД:ВКЛ" : "СЛЕД:АВТО");
+        // Кнопка регулировки времени удержания перед отпусканием пальца
+        speedBtn = makeSmallBtn("ПАУЗА:" + holdDurationMs, Color.parseColor("#1565C0"));
+        speedBtn.setOnClickListener(v -> {
+            if (holdDurationMs == 380) {
+                dragDurationMs = 800;
+                holdDurationMs = 520;
+            } else if (holdDurationMs == 520) {
+                dragDurationMs = 950;
+                holdDurationMs = 650;
+            } else {
+                dragDurationMs = 650;
+                holdDurationMs = 380;
+            }
+            speedBtn.setText("ПАУЗА:" + holdDurationMs);
             saveCurrentConfig();
         });
-        overlayView.addView(modeBtn);
+        overlayView.addView(speedBtn);
 
         Button btnYMinus = makeSmallBtn("Y-", Color.parseColor("#455A64"));
         btnYMinus.setOnClickListener(v -> {
-            dragScaleY += 0.04f; // чуть ниже подъем на верхних рядах
+            baseLiftCells -= 0.12f;
             saveCurrentConfig();
-            statusText.setText(String.format("Sy:%.2f", dragScaleY));
+            statusText.setText(String.format("L:%.2f", baseLiftCells));
         });
         overlayView.addView(btnYMinus);
 
         Button btnYPlus = makeSmallBtn("Y+", Color.parseColor("#455A64"));
         btnYPlus.setOnClickListener(v -> {
-            dragScaleY -= 0.04f; // сильнее подъем на верхних рядах
+            baseLiftCells += 0.12f;
             saveCurrentConfig();
-            statusText.setText(String.format("Sy:%.2f", dragScaleY));
+            statusText.setText(String.format("L:%.2f", baseLiftCells));
         });
         overlayView.addView(btnYPlus);
-
-        // Кнопка сброса/обновления калибровки
-        Button btnReset = makeSmallBtn("⟳", Color.parseColor("#00695C"));
-        btnReset.setOnClickListener(v -> {
-            for (int i = 0; i < 8; i++) { rowBiasCells[i] = 0f; colBiasCells[i] = 0f; }
-            saveCurrentConfig();
-            statusText.setText("Сброс рядов");
-        });
-        overlayView.addView(btnReset);
 
         statusText = new TextView(this);
         statusText.setText(" Готов ");
@@ -369,12 +368,11 @@ public class BotAccessibilityService extends AccessibilityService {
 
             float[] slotX = { screenW * 0.208f, screenW * 0.500f, screenW * 0.792f };
             float slotY = screenH * 0.754f;
-            float dockStep = screenW * 0.050f;
             int bgSample = beforeBmp.getPixel((int) (screenW * 0.5f), (int) (screenH * 0.675f));
 
             List<Piece> pieces = new ArrayList<>();
             for (int i = 0; i < 3; i++) {
-                Piece p = parsePiece(beforeBmp, slotX[i], slotY, dockStep, bgSample, i);
+                Piece p = parsePieceExact(beforeBmp, slotX[i], slotY, bgSample, i);
                 if (p != null) pieces.add(p);
             }
 
@@ -393,7 +391,6 @@ public class BotAccessibilityService extends AccessibilityService {
                 return;
             }
 
-            // Целевой прямоугольник и его центр на сетке 8x8
             float targetLeft = gridLeft + bestMove.col * cellSize;
             float targetTop = gridTop + bestMove.row * cellSize;
             float targetRight = targetLeft + bestMove.piece.cols * cellSize;
@@ -406,10 +403,8 @@ public class BotAccessibilityService extends AccessibilityService {
             float startX = bestMove.piece.centerX;
             float startY = bestMove.piece.centerY;
 
-            // В Block Blast фиксируется расстояние от пальца до НИЖНЕГО края фигуры (+ 0.5 * rows до центра)
-            // Плюс индивидуальная авто-поправка для конкретного ряда и столбца
             float effectiveLiftCells = baseLiftCells
-                    + rowHeightLiftFactor * bestMove.piece.rows
+                    + rowHeightLiftFactor * (bestMove.piece.rows - 1)
                     + rowBiasCells[bestMove.row];
             float liftPx = effectiveLiftCells * cellSize;
 
@@ -418,109 +413,91 @@ public class BotAccessibilityService extends AccessibilityService {
             float endY = startY + (targetCenterY - (startY - liftPx)) / dragScaleY;
 
             statusText.setText("#" + (bestMove.piece.slotIndex + 1) +
+                    "(" + bestMove.piece.rows + "x" + bestMove.piece.cols + ")" +
                     "->[" + (bestMove.row + 1) + "," + (bestMove.col + 1) + "]");
 
             boolean clearsLine = willClearLine(board, bestMove.piece, bestMove.row, bestMove.col);
-            long nextDelay = clearsLine ? 1250L : 700L;
+            long nextDelay = clearsLine ? 1300L : 750L;
 
-            executeTrackedMove(beforeBmp, bestMove, targetRect, startX, startY, endX, endY, cellSize, () -> {
+            executeMoveWithFullStop(beforeBmp, bestMove, targetRect, startX, startY, endX, endY, cellSize, () -> {
                 beforeBmp.recycle();
                 if (isRunning) handler.postDelayed(botLoop, nextDelay);
             });
         }
     };
 
-    // Выполняет ход со слежением за реальным положением фигуры на поле и авто-коррекцией
-    private void executeTrackedMove(Bitmap beforeBmp, Move move, RectF targetRect,
-                                    float sx, float sy, float ex, float ey, float cellSize,
-                                    Runnable onDone) {
+    // Плавный свайп + гарантированная полная остановка пальца в точке сброса перед отпусканием
+    private void executeMoveWithFullStop(Bitmap beforeBmp, Move move, RectF targetRect,
+                                         float sx, float sy, float ex, float ey, float cellSize,
+                                         Runnable onDone) {
         final float clampedEx = Math.max(25, Math.min(screenW - 25, ex));
         final float clampedEy = Math.max(25, Math.min(screenH - 25, ey));
 
-        if (trackAndSteer) {
-            // Режим 1: Захват -> подвод к цели -> визуальная проверка -> доводка пальцем -> сброс
-            Path step1Path = new Path();
-            step1Path.moveTo(sx, sy);
-            // Небольшая задержка на старте (12% длины в начале) + подвод к расчетной точке
-            step1Path.lineTo(sx, sy - 6f);
-            step1Path.lineTo(clampedEx, clampedEy);
+        if (sightView != null) {
+            sightView.showSight(targetRect, null, clampedEx, clampedEy);
+        }
 
-            GestureDescription.StrokeDescription stroke1 =
-                    new GestureDescription.StrokeDescription(step1Path, 0, 320, true);
-            GestureDescription.Builder b1 = new GestureDescription.Builder();
-            b1.addStroke(stroke1);
+        // Делаем контрольный снимок за 120 мс до отпускания пальца (не прерывая и не задерживая жест!)
+        long snapshotTime = dragDurationMs + Math.max(80, holdDurationMs - 120);
+        handler.postDelayed(() -> {
+            if (!isRunning) return;
+            Bitmap liveBmp = captureScreen();
+            if (liveBmp != null) {
+                RectF detected = detectFloatingPiece(beforeBmp, liveBmp, move.piece, cellSize);
+                liveBmp.recycle();
+                if (detected != null && sightView != null) {
+                    sightView.showSight(targetRect, detected, clampedEx, clampedEy);
+                    if (autoLearnRows) {
+                        float errY = targetRect.centerY() - detected.centerY();
+                        if (Math.abs(errY) < cellSize * 2.5f) {
+                            rowBiasCells[move.row] -= (errY / cellSize) * 0.35f;
+                            rowBiasCells[move.row] = Math.max(-2.0f, Math.min(2.0f, rowBiasCells[move.row]));
+                            saveCurrentConfig();
+                        }
+                    }
+                }
+            }
+        }, snapshotTime);
 
-            dispatchGesture(b1.build(), new GestureResultCallback() {
+        if (useTwoStageHold) {
+            // Заранее готовим оба сегмента жеста, чтобы переключение между ними заняло 0.0 мс
+            Path dragPath = new Path();
+            dragPath.moveTo(sx, sy);
+            // Плавный разгон и плавное торможение у цели
+            dragPath.lineTo(sx + (clampedEx - sx) * 0.85f, sy + (clampedEy - sy) * 0.85f);
+            dragPath.lineTo(clampedEx, clampedEy);
+
+            Path holdPath = new Path();
+            holdPath.moveTo(clampedEx, clampedEy);
+            holdPath.lineTo(clampedEx + 0.4f, clampedEy + 0.4f); // Полная неподвижность 380+ мс
+
+            final GestureDescription.StrokeDescription dragStroke =
+                    new GestureDescription.StrokeDescription(dragPath, 0, dragDurationMs, true);
+            final GestureDescription.StrokeDescription holdStroke =
+                    dragStroke.continueStroke(holdPath, 0, holdDurationMs, false);
+
+            GestureDescription.Builder dragBuilder = new GestureDescription.Builder();
+            dragBuilder.addStroke(dragStroke);
+
+            final GestureDescription holdGesture = new GestureDescription.Builder()
+                    .addStroke(holdStroke)
+                    .build();
+
+            dispatchGesture(dragBuilder.build(), new GestureResultCallback() {
                 @Override
                 public void onCompleted(GestureDescription gd) {
-                    // Удерживаем палец 95 мс, чтобы фигура стабилизировалась, и снимаем кадр
-                    Path holdPath = new Path();
-                    holdPath.moveTo(clampedEx, clampedEy);
-                    holdPath.lineTo(clampedEx + 1.5f, clampedEy + 1.5f);
-                    GestureDescription.StrokeDescription strokeHold =
-                            stroke1.continueStroke(holdPath, 0, 95, true);
-                    GestureDescription.Builder bHold = new GestureDescription.Builder();
-                    bHold.addStroke(strokeHold);
-
-                    dispatchGesture(bHold.build(), new GestureResultCallback() {
+                    // Мгновенный запуск удержания без единой миллисекунды задержки
+                    dispatchGesture(holdGesture, new GestureResultCallback() {
                         @Override
                         public void onCompleted(GestureDescription gd2) {
-                            Bitmap liveBmp = captureScreen();
-                            RectF detected = (liveBmp != null)
-                                    ? detectFloatingPiece(beforeBmp, liveBmp, move.piece, cellSize)
-                                    : null;
-                            if (liveBmp != null) liveBmp.recycle();
-
-                            float corrEx = clampedEx;
-                            float corrEy = clampedEy;
-
-                            if (detected != null) {
-                                float errX = targetRect.centerX() - detected.centerX();
-                                float errY = targetRect.centerY() - detected.centerY();
-
-                                if (sightView != null) {
-                                    sightView.showSight(targetRect, detected, corrEx, corrEy);
-                                    handler.postDelayed(() -> {
-                                        if (sightView != null) sightView.clearSight();
-                                    }, 450);
-                                }
-
-                                // Авто-обучение поправки для этого ряда и столбца
-                                if (autoLearnRows && Math.abs(errY) < cellSize * 3.5f) {
-                                    rowBiasCells[move.row] -= (errY / cellSize) * 0.45f;
-                                    rowBiasCells[move.row] = Math.max(-2.5f, Math.min(2.5f, rowBiasCells[move.row]));
-                                    colBiasCells[move.col] += (errX / cellSize) * 0.35f;
-                                    colBiasCells[move.col] = Math.max(-2.0f, Math.min(2.0f, colBiasCells[move.col]));
-                                    saveCurrentConfig();
-                                }
-
-                                // Доводим палец в реальном времени, если фигура смещена больше чем на 0.22 клетки
-                                if (Math.abs(errX) > cellSize * 0.22f || Math.abs(errY) > cellSize * 0.22f) {
-                                    corrEx = Math.max(25, Math.min(screenW - 25, clampedEx + (errX / dragScaleX)));
-                                    corrEy = Math.max(25, Math.min(screenH - 25, clampedEy + (errY / dragScaleY)));
-                                }
-                            }
-
-                            // Финальная доводка + мягкая фиксация на месте перед отпусканием
-                            Path finalPath = buildWiggleHoldPath(clampedEx + 1.5f, clampedEy + 1.5f, corrEx, corrEy, 6);
-                            GestureDescription.StrokeDescription strokeFinal =
-                                    strokeHold.continueStroke(finalPath, 0, 210, false);
-                            GestureDescription.Builder bFinal = new GestureDescription.Builder();
-                            bFinal.addStroke(strokeFinal);
-
-                            dispatchGesture(bFinal.build(), new GestureResultCallback() {
-                                @Override
-                                public void onCompleted(GestureDescription gd3) { onDone.run(); }
-                                @Override
-                                public void onCancelled(GestureDescription gd3) { onDone.run(); }
-                            }, null);
+                            if (sightView != null) sightView.clearSight();
+                            onDone.run();
                         }
 
                         @Override
                         public void onCancelled(GestureDescription gd2) {
-                            // Если система не поддерживает continueStroke, автоматически переключаемся на одиночный свайп с авто-калибровкой
-                            trackAndSteer = false;
-                            if (modeBtn != null) modeBtn.setText("СЛЕД:АВТО");
+                            useTwoStageHold = false;
+                            if (sightView != null) sightView.clearSight();
                             onDone.run();
                         }
                     }, null);
@@ -528,75 +505,124 @@ public class BotAccessibilityService extends AccessibilityService {
 
                 @Override
                 public void onCancelled(GestureDescription gd) {
+                    if (sightView != null) sightView.clearSight();
                     onDone.run();
                 }
             }, null);
         } else {
-            // Режим 2 (СЛЕД:АВТО): Единый непрерывный жест с настоящим удержанием 180 мс в конце пути
-            // и фото-контролем на 400-й миллисекунде для авто-калибровки каждого ряда
-            Path singlePath = buildWiggleHoldPath(sx, sy, clampedEx, clampedEy, 18);
+            // Резервный однофазный жест с микро-квадратом 0.8 px (держит палец неподвижно без тряски)
+            Path singlePath = buildMicroHoldPath(sx, sy, clampedEx, clampedEy);
             GestureDescription.StrokeDescription stroke =
-                    new GestureDescription.StrokeDescription(singlePath, 0, swipeDurationMs);
-            GestureDescription.Builder builder = new GestureDescription.Builder();
-            builder.addStroke(stroke);
-
-            // Снимаем кадр в момент, когда палец удерживает фигуру в конечной точке (за 110 мс до отпускания)
-            handler.postDelayed(() -> {
-                Bitmap liveBmp = captureScreen();
-                if (liveBmp != null) {
-                    RectF detected = detectFloatingPiece(beforeBmp, liveBmp, move.piece, cellSize);
-                    liveBmp.recycle();
-                    if (detected != null) {
-                        float errX = targetRect.centerX() - detected.centerX();
-                        float errY = targetRect.centerY() - detected.centerY();
-                        if (sightView != null) {
-                            sightView.showSight(targetRect, detected, clampedEx, clampedEy);
-                            handler.postDelayed(() -> {
-                                if (sightView != null) sightView.clearSight();
-                            }, 420);
-                        }
-                        if (autoLearnRows && Math.abs(errY) < cellSize * 3.5f) {
-                            rowBiasCells[move.row] -= (errY / cellSize) * 0.50f;
-                            rowBiasCells[move.row] = Math.max(-2.5f, Math.min(2.5f, rowBiasCells[move.row]));
-                            colBiasCells[move.col] += (errX / cellSize) * 0.35f;
-                            colBiasCells[move.col] = Math.max(-2.0f, Math.min(2.0f, colBiasCells[move.col]));
-                            saveCurrentConfig();
-                        }
-                    }
+                    new GestureDescription.StrokeDescription(singlePath, 0, dragDurationMs + holdDurationMs);
+            GestureDescription.Builder b = new GestureDescription.Builder();
+            b.addStroke(stroke);
+            dispatchGesture(b.build(), new GestureResultCallback() {
+                @Override
+                public void onCompleted(GestureDescription gd) {
+                    if (sightView != null) sightView.clearSight();
+                    onDone.run();
                 }
-            }, swipeDurationMs - 110);
 
-            dispatchGesture(builder.build(), new GestureResultCallback() {
                 @Override
-                public void onCompleted(GestureDescription gd) { onDone.run(); }
-                @Override
-                public void onCancelled(GestureDescription gd) { onDone.run(); }
+                public void onCancelled(GestureDescription gd) {
+                    if (sightView != null) sightView.clearSight();
+                    onDone.run();
+                }
             }, null);
         }
     }
 
-    // Создает путь, который гарантированно удерживает палец в конечной точке (ex, ey) перед отпусканием
-    private Path buildWiggleHoldPath(float sx, float sy, float ex, float ey, int holdLoops) {
+    // Создает микро-удержание в пределах 0.8 пикселя (для игры палец стоит абсолютно неподвижно)
+    private Path buildMicroHoldPath(float sx, float sy, float ex, float ey) {
         Path p = new Path();
         p.moveTo(sx, sy);
         p.lineTo(ex, ey);
         float dist = (float) Math.hypot(ex - sx, ey - sy);
-        // Подбираем амплитуду микро-удержания так, чтобы PathMeasure выделил ~35% времени на фиксацию в (ex, ey)
-        float step = Math.max(2.0f, Math.min(4.5f, (dist * 0.35f) / Math.max(1, holdLoops * 2)));
-        for (int i = 0; i < holdLoops; i++) {
-            p.lineTo(ex + step, ey);
-            p.lineTo(ex - step, ey);
+        float holdLengthNeeded = dist * ((float) holdDurationMs / Math.max(200, dragDurationMs));
+        float box = 0.8f; // 0.8 px = 0.007 клетки (полностью неподвижно для Unity)
+        int loops = Math.max(10, Math.min(90, (int) (holdLengthNeeded / (box * 4f))));
+        for (int i = 0; i < loops; i++) {
+            p.lineTo(ex + box, ey);
+            p.lineTo(ex + box, ey + box);
+            p.lineTo(ex, ey + box);
+            p.lineTo(ex, ey);
         }
-        p.lineTo(ex, ey);
         return p;
     }
 
-    // Находит реальное положение летящей фигуры на экране путем сравнения с кадром до начала хода
+    // Точное определение размеров 1..5 без ошибки округления 3x3 в 4x4
+    private int classifySpanBlocks(float spanPx) {
+        float ratio = spanPx / (float) screenW;
+        if (ratio < 0.078f) return 1;
+        if (ratio < 0.128f) return 2;
+        if (ratio < 0.178f) return 3; // Любой квадрат/уголок 3x3 (0.145..0.170) всегда строго = 3
+        if (ratio < 0.209f) return 4;
+        return 5;
+    }
+
+    private Piece parsePieceExact(Bitmap bmp, float cx, float cy, int bgColor, int slotIdx) {
+        int halfW = (int) (screenW * 0.142f);
+        int minX = Integer.MAX_VALUE, maxX = Integer.MIN_VALUE;
+        int minY = Integer.MAX_VALUE, maxY = Integer.MIN_VALUE;
+        int count = 0;
+
+        for (int y = (int) cy - halfW; y <= (int) cy + halfW; y += 2) {
+            for (int x = (int) cx - halfW; x <= (int) cx + halfW; x += 2) {
+                if (x < 0 || x >= screenW || y < 0 || y >= screenH) continue;
+                if (isPiecePixel(bmp.getPixel(x, y), bgColor)) {
+                    if (x < minX) minX = x;
+                    if (x > maxX) maxX = x;
+                    if (y < minY) minY = y;
+                    if (y > maxY) maxY = y;
+                    count++;
+                }
+            }
+        }
+        if (count < 16) return null;
+
+        int cols = classifySpanBlocks(maxX - minX);
+        int rows = classifySpanBlocks(maxY - minY);
+
+        int[][] shape = new int[rows][cols];
+        float boxW = (float) (maxX - minX) / cols;
+        float boxH = (float) (maxY - minY) / rows;
+        int filledBlocks = 0;
+
+        for (int r = 0; r < rows; r++) {
+            for (int c = 0; c < cols; c++) {
+                int sx = (int) (minX + (c + 0.5f) * boxW);
+                int sy = (int) (minY + (r + 0.5f) * boxH);
+                int hits = 0;
+                for (int dy = -6; dy <= 6; dy += 3) {
+                    for (int dx = -6; dx <= 6; dx += 3) {
+                        int px = Math.max(0, Math.min(screenW - 1, sx + dx));
+                        int py = Math.max(0, Math.min(screenH - 1, sy + dy));
+                        if (isPiecePixel(bmp.getPixel(px, py), bgColor)) hits++;
+                    }
+                }
+                if (hits >= 6) {
+                    shape[r][c] = 1;
+                    filledBlocks++;
+                }
+            }
+        }
+        if (filledBlocks == 0) return null;
+
+        Piece p = new Piece();
+        p.slotIndex = slotIdx;
+        p.rows = rows;
+        p.cols = cols;
+        p.shape = shape;
+        p.centerX = (minX + maxX) / 2.0f;
+        p.centerY = (minY + maxY) / 2.0f;
+        return p;
+    }
+
     private RectF detectFloatingPiece(Bitmap beforeBmp, Bitmap liveBmp, Piece piece, float cellSize) {
-        int topLimit = (int) (screenH * 0.14f);
-        int bottomLimit = (int) (screenH * 0.67f);
-        int leftLimit = (int) (screenW * 0.02f);
-        int rightLimit = (int) (screenW * 0.98f);
+        int topLimit = (int) (screenH * 0.16f);
+        int bottomLimit = (int) (screenH * 0.66f);
+        int leftLimit = (int) (screenW * 0.03f);
+        int rightLimit = (int) (screenW * 0.97f);
 
         List<Integer> xs = new ArrayList<>();
         List<Integer> ys = new ArrayList<>();
@@ -609,11 +635,10 @@ public class BotAccessibilityService extends AccessibilityService {
                 int diff = Math.abs(Color.red(cNow) - Color.red(cBefore))
                         + Math.abs(Color.green(cNow) - Color.green(cBefore))
                         + Math.abs(Color.blue(cNow) - Color.blue(cBefore));
-                if (diff < 65) continue;
+                if (diff < 70) continue;
 
                 float[] hsv = new float[3];
                 Color.colorToHSV(cNow, hsv);
-                // Игнорируем серый кружок касания пальца (у него низкая насыщенность) и берем только яркие блоки фигуры
                 if (hsv[1] > 0.42f && hsv[2] > 0.55f) {
                     xs.add(x);
                     ys.add(y);
@@ -625,11 +650,13 @@ public class BotAccessibilityService extends AccessibilityService {
         Collections.sort(xs);
         Collections.sort(ys);
 
-        // Берем 10%..90% квантили для защиты от случайных бликов
-        int minX = xs.get((int) (xs.size() * 0.08f));
-        int maxX = xs.get((int) (xs.size() * 0.92f));
-        int minY = ys.get((int) (ys.size() * 0.08f));
-        int maxY = ys.get((int) (ys.size() * 0.92f));
+        int minX = xs.get((int) (xs.size() * 0.10f));
+        int maxX = xs.get((int) (xs.size() * 0.90f));
+        int minY = ys.get((int) (ys.size() * 0.10f));
+        int maxY = ys.get((int) (ys.size() * 0.90f));
+
+        // Если светится вся линия из 8 клеток (предпросмотр взрыва линии), игнорируем её
+        if ((maxX - minX) > cellSize * 6.2f || (maxY - minY) > cellSize * 6.2f) return null;
 
         float cx = (minX + maxX) / 2.0f;
         float cy = (minY + maxY) / 2.0f;
@@ -639,7 +666,6 @@ public class BotAccessibilityService extends AccessibilityService {
         return new RectF(cx - halfW, cy - halfH, cx + halfW, cy + halfH);
     }
 
-    // Прозрачный прицел поверх экрана (Зеленый = куда ставим, Желтый = где бот видит фигуру)
     private static class SightOverlayView extends View {
         private final Paint targetPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint detectedPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -652,14 +678,14 @@ public class BotAccessibilityService extends AccessibilityService {
             super(context);
             targetPaint.setStyle(Paint.Style.STROKE);
             targetPaint.setStrokeWidth(5f);
-            targetPaint.setColor(Color.parseColor("#00E676")); // Ярко-зеленый
+            targetPaint.setColor(Color.parseColor("#00E676"));
 
             detectedPaint.setStyle(Paint.Style.STROKE);
             detectedPaint.setStrokeWidth(5f);
-            detectedPaint.setColor(Color.parseColor("#FFEA00")); // Ярко-желтый
+            detectedPaint.setColor(Color.parseColor("#FFEA00"));
 
             fingerPaint.setStyle(Paint.Style.FILL);
-            fingerPaint.setColor(Color.parseColor("#FF1744")); // Красная точка пальца
+            fingerPaint.setColor(Color.parseColor("#FF1744"));
         }
 
         public void showSight(RectF target, RectF detected, float fx, float fy) {
@@ -701,64 +727,6 @@ public class BotAccessibilityService extends AccessibilityService {
         Color.colorToHSV(color, hsv);
 
         return diff > 45 && (hsv[1] > 0.45f || hsv[2] > 0.62f);
-    }
-
-    private Piece parsePiece(Bitmap bmp, float cx, float cy, float step, int bgColor, int slotIdx) {
-        int halfW = (int) (step * 2.85f);
-        int minX = Integer.MAX_VALUE, maxX = Integer.MIN_VALUE;
-        int minY = Integer.MAX_VALUE, maxY = Integer.MIN_VALUE;
-        int count = 0;
-
-        for (int y = (int) cy - halfW; y <= (int) cy + halfW; y += 2) {
-            for (int x = (int) cx - halfW; x <= (int) cx + halfW; x += 2) {
-                if (x < 0 || x >= screenW || y < 0 || y >= screenH) continue;
-                if (isPiecePixel(bmp.getPixel(x, y), bgColor)) {
-                    if (x < minX) minX = x;
-                    if (x > maxX) maxX = x;
-                    if (y < minY) minY = y;
-                    if (y > maxY) maxY = y;
-                    count++;
-                }
-            }
-        }
-        if (count < 16) return null;
-
-        int cols = Math.max(1, Math.min(5, Math.round((maxX - minX) / step + 0.12f)));
-        int rows = Math.max(1, Math.min(5, Math.round((maxY - minY) / step + 0.12f)));
-
-        int[][] shape = new int[rows][cols];
-        float boxW = (float) (maxX - minX) / cols;
-        float boxH = (float) (maxY - minY) / rows;
-        int filledBlocks = 0;
-
-        for (int r = 0; r < rows; r++) {
-            for (int c = 0; c < cols; c++) {
-                int sx = (int) (minX + (c + 0.5f) * boxW);
-                int sy = (int) (minY + (r + 0.5f) * boxH);
-                int hits = 0;
-                for (int dy = -6; dy <= 6; dy += 3) {
-                    for (int dx = -6; dx <= 6; dx += 3) {
-                        int px = Math.max(0, Math.min(screenW - 1, sx + dx));
-                        int py = Math.max(0, Math.min(screenH - 1, sy + dy));
-                        if (isPiecePixel(bmp.getPixel(px, py), bgColor)) hits++;
-                    }
-                }
-                if (hits >= 6) {
-                    shape[r][c] = 1;
-                    filledBlocks++;
-                }
-            }
-        }
-        if (filledBlocks == 0) return null;
-
-        Piece p = new Piece();
-        p.slotIndex = slotIdx;
-        p.rows = rows;
-        p.cols = cols;
-        p.shape = shape;
-        p.centerX = (minX + maxX) / 2.0f;
-        p.centerY = (minY + maxY) / 2.0f;
-        return p;
     }
 
     private boolean willClearLine(int[][] board, Piece p, int row, int col) {
