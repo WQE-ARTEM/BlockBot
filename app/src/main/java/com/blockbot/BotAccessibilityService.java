@@ -2,10 +2,15 @@ package com.blockbot;
 
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
+import android.content.Context;
+import android.content.SharedPreferences;
 import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
+import android.graphics.RectF;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
 import android.media.Image;
@@ -15,6 +20,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
+import android.view.View;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.widget.Button;
@@ -22,6 +28,17 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.URL;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -32,8 +49,10 @@ public class BotAccessibilityService extends AccessibilityService {
 
     private WindowManager wm;
     private LinearLayout overlayView;
+    private SightOverlayView sightView;
     private TextView statusText;
     private Button toggleBtn;
+    private Button modeBtn;
 
     private MediaProjection projection;
     private ImageReader imageReader;
@@ -42,14 +61,21 @@ public class BotAccessibilityService extends AccessibilityService {
     private int screenW, screenH, screenDensity;
     private boolean isRunning = false;
     private final Handler handler = new Handler(Looper.getMainLooper());
+    private SharedPreferences prefs;
+    private ServerSocket localServer;
 
-    // Точные коэффициенты, вычисленные по видео с точкой касания:
-    // 1) При касании слота фигура подскакивает вверх на 2.48 клетки
-    // 2) По горизонтали фигура движется в 1.50 раза быстрее пальца
-    // 3) По вертикали фигура движется в 1.65 раза быстрее пальца
-    private float liftCells = 2.48f;
-    private float dragScaleX = 1.50f;
-    private float dragScaleY = 1.65f;
+    // Параметры управления (обновляются без переустановки через Termux 127.0.0.1:8765 или GitHub)
+    private float baseLiftCells = 1.98f;
+    private float rowHeightLiftFactor = 0.50f;
+    private float dragScaleX = 1.48f;
+    private float dragScaleY = 1.26f;
+    private boolean trackAndSteer = true;
+    private boolean autoLearnRows = true;
+    private int swipeDurationMs = 540;
+
+    // Индивидуальные поправки для каждого из 8 рядов и 8 столбцов (в клетках поля)
+    private final float[] rowBiasCells = new float[8];
+    private final float[] colBiasCells = new float[8];
 
     @Override
     protected void onServiceConnected() {
@@ -60,12 +86,112 @@ public class BotAccessibilityService extends AccessibilityService {
         screenW = dm.widthPixels;
         screenH = dm.heightPixels;
         screenDensity = dm.densityDpi;
+        prefs = getSharedPreferences("blockbot_cfg", Context.MODE_PRIVATE);
+        loadSavedConfig();
+        startLocalHotUpdateServer();
+    }
+
+    private void loadSavedConfig() {
+        try {
+            String jsonStr = prefs.getString("json", null);
+            if (jsonStr != null) applyJsonConfig(new JSONObject(jsonStr), false);
+        } catch (Exception ignored) {}
+    }
+
+    private void applyJsonConfig(JSONObject obj, boolean save) {
+        try {
+            if (obj.has("baseLiftCells")) baseLiftCells = (float) obj.getDouble("baseLiftCells");
+            if (obj.has("rowHeightLiftFactor")) rowHeightLiftFactor = (float) obj.getDouble("rowHeightLiftFactor");
+            if (obj.has("dragScaleX")) dragScaleX = (float) obj.getDouble("dragScaleX");
+            if (obj.has("dragScaleY")) dragScaleY = (float) obj.getDouble("dragScaleY");
+            if (obj.has("trackAndSteer")) trackAndSteer = obj.getBoolean("trackAndSteer");
+            if (obj.has("autoLearnRows")) autoLearnRows = obj.getBoolean("autoLearnRows");
+            if (obj.has("swipeDurationMs")) swipeDurationMs = obj.getInt("swipeDurationMs");
+            if (obj.has("resetBias") && obj.getBoolean("resetBias")) {
+                for (int i = 0; i < 8; i++) { rowBiasCells[i] = 0f; colBiasCells[i] = 0f; }
+            }
+            if (obj.has("rowBiasCells")) {
+                JSONArray arr = obj.getJSONArray("rowBiasCells");
+                for (int i = 0; i < Math.min(8, arr.length()); i++) rowBiasCells[i] = (float) arr.getDouble(i);
+            }
+            if (obj.has("colBiasCells")) {
+                JSONArray arr = obj.getJSONArray("colBiasCells");
+                for (int i = 0; i < Math.min(8, arr.length()); i++) colBiasCells[i] = (float) arr.getDouble(i);
+            }
+            if (save) saveCurrentConfig();
+            handler.post(() -> {
+                if (statusText != null) statusText.setText(String.format("Обновлено! Y:%.2f", dragScaleY));
+                if (modeBtn != null) modeBtn.setText(trackAndSteer ? "СЛЕД:ВКЛ" : "СЛЕД:АВТО");
+            });
+        } catch (Exception ignored) {}
+    }
+
+    private void saveCurrentConfig() {
+        try {
+            JSONObject obj = new JSONObject();
+            obj.put("baseLiftCells", baseLiftCells);
+            obj.put("rowHeightLiftFactor", rowHeightLiftFactor);
+            obj.put("dragScaleX", dragScaleX);
+            obj.put("dragScaleY", dragScaleY);
+            obj.put("trackAndSteer", trackAndSteer);
+            obj.put("autoLearnRows", autoLearnRows);
+            obj.put("swipeDurationMs", swipeDurationMs);
+            JSONArray rArr = new JSONArray();
+            JSONArray cArr = new JSONArray();
+            for (int i = 0; i < 8; i++) {
+                rArr.put(rowBiasCells[i]);
+                cArr.put(colBiasCells[i]);
+            }
+            obj.put("rowBiasCells", rArr);
+            obj.put("colBiasCells", cArr);
+            prefs.edit().putString("json", obj.toString()).apply();
+        } catch (Exception ignored) {}
+    }
+
+    // Локальный сервер 127.0.0.1:8765 для мгновенного обновления настроек из Termux без переустановки APK
+    private void startLocalHotUpdateServer() {
+        new Thread(() -> {
+            try {
+                if (localServer != null) localServer.close();
+                localServer = new ServerSocket(8765, 5, InetAddress.getByName("127.0.0.1"));
+                while (!localServer.isClosed()) {
+                    Socket client = localServer.accept();
+                    BufferedReader in = new BufferedReader(new InputStreamReader(client.getInputStream()));
+                    StringBuilder body = new StringBuilder();
+                    String line;
+                    int contentLength = 0;
+                    while ((line = in.readLine()) != null && !line.isEmpty()) {
+                        if (line.toLowerCase().startsWith("content-length:")) {
+                            contentLength = Integer.parseInt(line.substring(15).trim());
+                        }
+                    }
+                    if (contentLength > 0) {
+                        char[] buf = new char[contentLength];
+                        int read = 0;
+                        while (read < contentLength) {
+                            int r = in.read(buf, read, contentLength - read);
+                            if (r == -1) break;
+                            read += r;
+                        }
+                        body.append(buf, 0, read);
+                    }
+                    if (body.length() > 0) {
+                        applyJsonConfig(new JSONObject(body.toString()), true);
+                    }
+                    OutputStream out = client.getOutputStream();
+                    String resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nOK\n";
+                    out.write(resp.getBytes());
+                    out.flush();
+                    client.close();
+                }
+            } catch (Exception ignored) {}
+        }).start();
     }
 
     public void initProjection(MediaProjection mp) {
         stopProjection();
         this.projection = mp;
-        imageReader = ImageReader.newInstance(screenW, screenH, PixelFormat.RGBA_8888, 2);
+        imageReader = ImageReader.newInstance(screenW, screenH, PixelFormat.RGBA_8888, 3);
         virtualDisplay = projection.createVirtualDisplay("BlockBotDisplay",
                 screenW, screenH, screenDensity,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
@@ -93,10 +219,12 @@ public class BotAccessibilityService extends AccessibilityService {
     private void closeOverlayAndStop() {
         stopProjection();
         if (overlayView != null && wm != null) {
-            try {
-                wm.removeView(overlayView);
-            } catch (Exception ignored) {}
+            try { wm.removeView(overlayView); } catch (Exception ignored) {}
             overlayView = null;
+        }
+        if (sightView != null && wm != null) {
+            try { wm.removeView(sightView); } catch (Exception ignored) {}
+            sightView = null;
         }
         Toast.makeText(this, "BlockBot закрыт", Toast.LENGTH_SHORT).show();
     }
@@ -105,26 +233,39 @@ public class BotAccessibilityService extends AccessibilityService {
         Button b = new Button(this);
         b.setText(label);
         b.setTextColor(Color.WHITE);
-        b.setTextSize(11);
-        b.setPadding(16, 6, 16, 6);
+        b.setTextSize(10);
+        b.setPadding(12, 6, 12, 6);
         b.setMinimumWidth(0);
         b.setMinWidth(0);
         b.setBackgroundColor(bgColor);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT);
-        lp.setMargins(5, 0, 5, 0);
+        lp.setMargins(4, 0, 4, 0);
         b.setLayoutParams(lp);
         return b;
     }
 
     private void showOverlay() {
+        if (sightView == null) {
+            sightView = new SightOverlayView(this);
+            WindowManager.LayoutParams sp = new WindowManager.LayoutParams(
+                    WindowManager.LayoutParams.MATCH_PARENT,
+                    WindowManager.LayoutParams.MATCH_PARENT,
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                            | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                            | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                    PixelFormat.TRANSLUCENT);
+            wm.addView(sightView, sp);
+        }
+
         if (overlayView != null) return;
 
         overlayView = new LinearLayout(this);
         overlayView.setOrientation(LinearLayout.HORIZONTAL);
-        overlayView.setBackgroundColor(Color.argb(220, 20, 25, 45));
-        overlayView.setPadding(10, 8, 10, 8);
+        overlayView.setBackgroundColor(Color.argb(225, 20, 25, 45));
+        overlayView.setPadding(10, 6, 10, 6);
         overlayView.setGravity(Gravity.CENTER_VERTICAL);
 
         toggleBtn = makeSmallBtn("СТАРТ", Color.parseColor("#2E7D32"));
@@ -132,43 +273,49 @@ public class BotAccessibilityService extends AccessibilityService {
             isRunning = !isRunning;
             toggleBtn.setText(isRunning ? "СТОП" : "СТАРТ");
             toggleBtn.setBackgroundColor(Color.parseColor(isRunning ? "#C62828" : "#2E7D32"));
+            if (!isRunning && sightView != null) sightView.clearSight();
             if (isRunning) handler.post(botLoop);
         });
         overlayView.addView(toggleBtn);
 
+        modeBtn = makeSmallBtn(trackAndSteer ? "СЛЕД:ВКЛ" : "СЛЕД:АВТО", Color.parseColor("#1565C0"));
+        modeBtn.setOnClickListener(v -> {
+            trackAndSteer = !trackAndSteer;
+            modeBtn.setText(trackAndSteer ? "СЛЕД:ВКЛ" : "СЛЕД:АВТО");
+            saveCurrentConfig();
+        });
+        overlayView.addView(modeBtn);
+
         Button btnYMinus = makeSmallBtn("Y-", Color.parseColor("#455A64"));
         btnYMinus.setOnClickListener(v -> {
-            liftCells -= 0.10f;
-            statusText.setText(String.format("Y:%.2f", liftCells));
+            dragScaleY += 0.04f; // чуть ниже подъем на верхних рядах
+            saveCurrentConfig();
+            statusText.setText(String.format("Sy:%.2f", dragScaleY));
         });
         overlayView.addView(btnYMinus);
 
         Button btnYPlus = makeSmallBtn("Y+", Color.parseColor("#455A64"));
         btnYPlus.setOnClickListener(v -> {
-            liftCells += 0.10f;
-            statusText.setText(String.format("Y:%.2f", liftCells));
+            dragScaleY -= 0.04f; // сильнее подъем на верхних рядах
+            saveCurrentConfig();
+            statusText.setText(String.format("Sy:%.2f", dragScaleY));
         });
         overlayView.addView(btnYPlus);
 
-        Button btnXMinus = makeSmallBtn("X-", Color.parseColor("#37474F"));
-        btnXMinus.setOnClickListener(v -> {
-            dragScaleX -= 0.04f;
-            statusText.setText(String.format("X:%.2f", dragScaleX));
+        // Кнопка сброса/обновления калибровки
+        Button btnReset = makeSmallBtn("⟳", Color.parseColor("#00695C"));
+        btnReset.setOnClickListener(v -> {
+            for (int i = 0; i < 8; i++) { rowBiasCells[i] = 0f; colBiasCells[i] = 0f; }
+            saveCurrentConfig();
+            statusText.setText("Сброс рядов");
         });
-        overlayView.addView(btnXMinus);
-
-        Button btnXPlus = makeSmallBtn("X+", Color.parseColor("#37474F"));
-        btnXPlus.setOnClickListener(v -> {
-            dragScaleX += 0.04f;
-            statusText.setText(String.format("X:%.2f", dragScaleX));
-        });
-        overlayView.addView(btnXPlus);
+        overlayView.addView(btnReset);
 
         statusText = new TextView(this);
         statusText.setText(" Готов ");
         statusText.setTextColor(Color.WHITE);
-        statusText.setTextSize(11);
-        statusText.setPadding(8, 0, 8, 0);
+        statusText.setTextSize(10);
+        statusText.setPadding(6, 0, 6, 0);
         overlayView.addView(statusText);
 
         Button btnClose = makeSmallBtn("✕", Color.parseColor("#B71C1C"));
@@ -191,9 +338,10 @@ public class BotAccessibilityService extends AccessibilityService {
         @Override
         public void run() {
             if (!isRunning) return;
+            if (sightView != null) sightView.clearSight();
 
-            Bitmap bmp = captureScreen();
-            if (bmp == null) {
+            Bitmap beforeBmp = captureScreen();
+            if (beforeBmp == null) {
                 handler.postDelayed(this, 300);
                 return;
             }
@@ -203,7 +351,6 @@ public class BotAccessibilityService extends AccessibilityService {
             float cellSize = gridWidth / 8.0f;
             float gridTop = screenH * 0.232f;
 
-            // Считываем поле 8x8 по нескольким точкам внутри каждой клетки
             int[][] board = new int[8][8];
             for (int r = 0; r < 8; r++) {
                 for (int c = 0; c < 8; c++) {
@@ -211,11 +358,11 @@ public class BotAccessibilityService extends AccessibilityService {
                     int cy = (int) (gridTop + (r + 0.5f) * cellSize);
                     int filledVotes = 0;
                     int offset = (int) (cellSize * 0.18f);
-                    if (isFilledBoardCell(bmp.getPixel(cx, cy))) filledVotes++;
-                    if (isFilledBoardCell(bmp.getPixel(cx - offset, cy))) filledVotes++;
-                    if (isFilledBoardCell(bmp.getPixel(cx + offset, cy))) filledVotes++;
-                    if (isFilledBoardCell(bmp.getPixel(cx, cy - offset))) filledVotes++;
-                    if (isFilledBoardCell(bmp.getPixel(cx, cy + offset))) filledVotes++;
+                    if (isFilledBoardCell(beforeBmp.getPixel(cx, cy))) filledVotes++;
+                    if (isFilledBoardCell(beforeBmp.getPixel(cx - offset, cy))) filledVotes++;
+                    if (isFilledBoardCell(beforeBmp.getPixel(cx + offset, cy))) filledVotes++;
+                    if (isFilledBoardCell(beforeBmp.getPixel(cx, cy - offset))) filledVotes++;
+                    if (isFilledBoardCell(beforeBmp.getPixel(cx, cy + offset))) filledVotes++;
                     board[r][c] = (filledVotes >= 3) ? 1 : 0;
                 }
             }
@@ -223,17 +370,16 @@ public class BotAccessibilityService extends AccessibilityService {
             float[] slotX = { screenW * 0.208f, screenW * 0.500f, screenW * 0.792f };
             float slotY = screenH * 0.754f;
             float dockStep = screenW * 0.050f;
-
-            int bgSample = bmp.getPixel((int) (screenW * 0.5f), (int) (screenH * 0.675f));
+            int bgSample = beforeBmp.getPixel((int) (screenW * 0.5f), (int) (screenH * 0.675f));
 
             List<Piece> pieces = new ArrayList<>();
             for (int i = 0; i < 3; i++) {
-                Piece p = parsePiece(bmp, slotX[i], slotY, dockStep, bgSample, i);
+                Piece p = parsePiece(beforeBmp, slotX[i], slotY, dockStep, bgSample, i);
                 if (p != null) pieces.add(p);
             }
-            bmp.recycle();
 
             if (pieces.isEmpty()) {
+                beforeBmp.recycle();
                 statusText.setText("Жду...");
                 handler.postDelayed(this, 450);
                 return;
@@ -241,76 +387,302 @@ public class BotAccessibilityService extends AccessibilityService {
 
             Move bestMove = findBestMoveForAllPieces(board, pieces);
             if (bestMove == null) {
+                beforeBmp.recycle();
                 statusText.setText("Нет ходов");
                 handler.postDelayed(this, 800);
                 return;
             }
 
-            statusText.setText("#" + (bestMove.piece.slotIndex + 1) +
-                    " (" + bestMove.piece.rows + "x" + bestMove.piece.cols + ")" +
-                    "->[" + (bestMove.row + 1) + "," + (bestMove.col + 1) + "]");
+            // Целевой прямоугольник и его центр на сетке 8x8
+            float targetLeft = gridLeft + bestMove.col * cellSize;
+            float targetTop = gridTop + bestMove.row * cellSize;
+            float targetRight = targetLeft + bestMove.piece.cols * cellSize;
+            float targetBottom = targetTop + bestMove.piece.rows * cellSize;
+            RectF targetRect = new RectF(targetLeft, targetTop, targetRight, targetBottom);
 
-            // Центр целевой области на сетке 8x8
-            float targetCenterX = gridLeft + (bestMove.col + bestMove.piece.cols / 2.0f) * cellSize;
-            float targetCenterY = gridTop + (bestMove.row + bestMove.piece.rows / 2.0f) * cellSize;
+            float targetCenterX = targetRect.centerX();
+            float targetCenterY = targetRect.centerY();
 
-            // Точка старта пальца — центр фигуры в слоте
             float startX = bestMove.piece.centerX;
             float startY = bestMove.piece.centerY;
 
-            // Точный расчет конечной точки пальца по формуле из видео
-            float liftPx = liftCells * cellSize;
-            float endX = startX + (targetCenterX - startX) / dragScaleX;
+            // В Block Blast фиксируется расстояние от пальца до НИЖНЕГО края фигуры (+ 0.5 * rows до центра)
+            // Плюс индивидуальная авто-поправка для конкретного ряда и столбца
+            float effectiveLiftCells = baseLiftCells
+                    + rowHeightLiftFactor * bestMove.piece.rows
+                    + rowBiasCells[bestMove.row];
+            float liftPx = effectiveLiftCells * cellSize;
+
+            float aimedTargetX = targetCenterX + colBiasCells[bestMove.col] * cellSize;
+            float endX = startX + (aimedTargetX - startX) / dragScaleX;
             float endY = startY + (targetCenterY - (startY - liftPx)) / dragScaleY;
 
-            // Проверяем, сгорит ли линия после этого хода (нужна ли пауза под анимацию Combo/+10)
-            boolean clearsLine = willClearLine(board, bestMove.piece, bestMove.row, bestMove.col);
-            long nextDelay = clearsLine ? 1250L : 650L;
+            statusText.setText("#" + (bestMove.piece.slotIndex + 1) +
+                    "->[" + (bestMove.row + 1) + "," + (bestMove.col + 1) + "]");
 
-            performSmoothDrag(startX, startY, endX, endY, () -> {
+            boolean clearsLine = willClearLine(board, bestMove.piece, bestMove.row, bestMove.col);
+            long nextDelay = clearsLine ? 1250L : 700L;
+
+            executeTrackedMove(beforeBmp, bestMove, targetRect, startX, startY, endX, endY, cellSize, () -> {
+                beforeBmp.recycle();
                 if (isRunning) handler.postDelayed(botLoop, nextDelay);
             });
         }
     };
 
-    // Единый непрерывный жест без continueStroke (не вызывает ACTION_CANCEL на HyperOS/MIUI)
-    // В конце пути делает микро-удержание в целевой точке, чтобы фигура встала в сетку перед отпусканием
-    private void performSmoothDrag(float sx, float sy, float ex, float ey, Runnable onDone) {
-        ex = Math.max(25, Math.min(screenW - 25, ex));
-        ey = Math.max(25, Math.min(screenH - 25, ey));
+    // Выполняет ход со слежением за реальным положением фигуры на поле и авто-коррекцией
+    private void executeTrackedMove(Bitmap beforeBmp, Move move, RectF targetRect,
+                                    float sx, float sy, float ex, float ey, float cellSize,
+                                    Runnable onDone) {
+        final float clampedEx = Math.max(25, Math.min(screenW - 25, ex));
+        final float clampedEy = Math.max(25, Math.min(screenH - 25, ey));
 
-        Path path = new Path();
-        path.moveTo(sx, sy);
+        if (trackAndSteer) {
+            // Режим 1: Захват -> подвод к цели -> визуальная проверка -> доводка пальцем -> сброс
+            Path step1Path = new Path();
+            step1Path.moveTo(sx, sy);
+            // Небольшая задержка на старте (12% длины в начале) + подвод к расчетной точке
+            step1Path.lineTo(sx, sy - 6f);
+            step1Path.lineTo(clampedEx, clampedEy);
 
-        // Плавно подводим к цели (92% пути) и мягко доводим до точной координаты
-        float midX = sx + (ex - sx) * 0.92f;
-        float midY = sy + (ey - sy) * 0.92f;
-        path.lineTo(midX, midY);
-        path.lineTo(ex, ey);
+            GestureDescription.StrokeDescription stroke1 =
+                    new GestureDescription.StrokeDescription(step1Path, 0, 320, true);
+            GestureDescription.Builder b1 = new GestureDescription.Builder();
+            b1.addStroke(stroke1);
 
-        // Микро-фиксация пальца на месте (1.5 px), чтобы погасить инерцию фигуры перед ACTION_UP
-        path.lineTo(ex + 1.5f, ey);
-        path.lineTo(ex - 1.5f, ey);
-        path.lineTo(ex, ey + 1.5f);
-        path.lineTo(ex, ey);
+            dispatchGesture(b1.build(), new GestureResultCallback() {
+                @Override
+                public void onCompleted(GestureDescription gd) {
+                    // Удерживаем палец 95 мс, чтобы фигура стабилизировалась, и снимаем кадр
+                    Path holdPath = new Path();
+                    holdPath.moveTo(clampedEx, clampedEy);
+                    holdPath.lineTo(clampedEx + 1.5f, clampedEy + 1.5f);
+                    GestureDescription.StrokeDescription strokeHold =
+                            stroke1.continueStroke(holdPath, 0, 95, true);
+                    GestureDescription.Builder bHold = new GestureDescription.Builder();
+                    bHold.addStroke(strokeHold);
 
-        GestureDescription.StrokeDescription stroke =
-                new GestureDescription.StrokeDescription(path, 0, 520);
+                    dispatchGesture(bHold.build(), new GestureResultCallback() {
+                        @Override
+                        public void onCompleted(GestureDescription gd2) {
+                            Bitmap liveBmp = captureScreen();
+                            RectF detected = (liveBmp != null)
+                                    ? detectFloatingPiece(beforeBmp, liveBmp, move.piece, cellSize)
+                                    : null;
+                            if (liveBmp != null) liveBmp.recycle();
 
-        GestureDescription.Builder builder = new GestureDescription.Builder();
-        builder.addStroke(stroke);
+                            float corrEx = clampedEx;
+                            float corrEy = clampedEy;
 
-        dispatchGesture(builder.build(), new GestureResultCallback() {
-            @Override
-            public void onCompleted(GestureDescription gestureDescription) {
-                onDone.run();
+                            if (detected != null) {
+                                float errX = targetRect.centerX() - detected.centerX();
+                                float errY = targetRect.centerY() - detected.centerY();
+
+                                if (sightView != null) {
+                                    sightView.showSight(targetRect, detected, corrEx, corrEy);
+                                    handler.postDelayed(() -> {
+                                        if (sightView != null) sightView.clearSight();
+                                    }, 450);
+                                }
+
+                                // Авто-обучение поправки для этого ряда и столбца
+                                if (autoLearnRows && Math.abs(errY) < cellSize * 3.5f) {
+                                    rowBiasCells[move.row] -= (errY / cellSize) * 0.45f;
+                                    rowBiasCells[move.row] = Math.max(-2.5f, Math.min(2.5f, rowBiasCells[move.row]));
+                                    colBiasCells[move.col] += (errX / cellSize) * 0.35f;
+                                    colBiasCells[move.col] = Math.max(-2.0f, Math.min(2.0f, colBiasCells[move.col]));
+                                    saveCurrentConfig();
+                                }
+
+                                // Доводим палец в реальном времени, если фигура смещена больше чем на 0.22 клетки
+                                if (Math.abs(errX) > cellSize * 0.22f || Math.abs(errY) > cellSize * 0.22f) {
+                                    corrEx = Math.max(25, Math.min(screenW - 25, clampedEx + (errX / dragScaleX)));
+                                    corrEy = Math.max(25, Math.min(screenH - 25, clampedEy + (errY / dragScaleY)));
+                                }
+                            }
+
+                            // Финальная доводка + мягкая фиксация на месте перед отпусканием
+                            Path finalPath = buildWiggleHoldPath(clampedEx + 1.5f, clampedEy + 1.5f, corrEx, corrEy, 6);
+                            GestureDescription.StrokeDescription strokeFinal =
+                                    strokeHold.continueStroke(finalPath, 0, 210, false);
+                            GestureDescription.Builder bFinal = new GestureDescription.Builder();
+                            bFinal.addStroke(strokeFinal);
+
+                            dispatchGesture(bFinal.build(), new GestureResultCallback() {
+                                @Override
+                                public void onCompleted(GestureDescription gd3) { onDone.run(); }
+                                @Override
+                                public void onCancelled(GestureDescription gd3) { onDone.run(); }
+                            }, null);
+                        }
+
+                        @Override
+                        public void onCancelled(GestureDescription gd2) {
+                            // Если система не поддерживает continueStroke, автоматически переключаемся на одиночный свайп с авто-калибровкой
+                            trackAndSteer = false;
+                            if (modeBtn != null) modeBtn.setText("СЛЕД:АВТО");
+                            onDone.run();
+                        }
+                    }, null);
+                }
+
+                @Override
+                public void onCancelled(GestureDescription gd) {
+                    onDone.run();
+                }
+            }, null);
+        } else {
+            // Режим 2 (СЛЕД:АВТО): Единый непрерывный жест с настоящим удержанием 180 мс в конце пути
+            // и фото-контролем на 400-й миллисекунде для авто-калибровки каждого ряда
+            Path singlePath = buildWiggleHoldPath(sx, sy, clampedEx, clampedEy, 18);
+            GestureDescription.StrokeDescription stroke =
+                    new GestureDescription.StrokeDescription(singlePath, 0, swipeDurationMs);
+            GestureDescription.Builder builder = new GestureDescription.Builder();
+            builder.addStroke(stroke);
+
+            // Снимаем кадр в момент, когда палец удерживает фигуру в конечной точке (за 110 мс до отпускания)
+            handler.postDelayed(() -> {
+                Bitmap liveBmp = captureScreen();
+                if (liveBmp != null) {
+                    RectF detected = detectFloatingPiece(beforeBmp, liveBmp, move.piece, cellSize);
+                    liveBmp.recycle();
+                    if (detected != null) {
+                        float errX = targetRect.centerX() - detected.centerX();
+                        float errY = targetRect.centerY() - detected.centerY();
+                        if (sightView != null) {
+                            sightView.showSight(targetRect, detected, clampedEx, clampedEy);
+                            handler.postDelayed(() -> {
+                                if (sightView != null) sightView.clearSight();
+                            }, 420);
+                        }
+                        if (autoLearnRows && Math.abs(errY) < cellSize * 3.5f) {
+                            rowBiasCells[move.row] -= (errY / cellSize) * 0.50f;
+                            rowBiasCells[move.row] = Math.max(-2.5f, Math.min(2.5f, rowBiasCells[move.row]));
+                            colBiasCells[move.col] += (errX / cellSize) * 0.35f;
+                            colBiasCells[move.col] = Math.max(-2.0f, Math.min(2.0f, colBiasCells[move.col]));
+                            saveCurrentConfig();
+                        }
+                    }
+                }
+            }, swipeDurationMs - 110);
+
+            dispatchGesture(builder.build(), new GestureResultCallback() {
+                @Override
+                public void onCompleted(GestureDescription gd) { onDone.run(); }
+                @Override
+                public void onCancelled(GestureDescription gd) { onDone.run(); }
+            }, null);
+        }
+    }
+
+    // Создает путь, который гарантированно удерживает палец в конечной точке (ex, ey) перед отпусканием
+    private Path buildWiggleHoldPath(float sx, float sy, float ex, float ey, int holdLoops) {
+        Path p = new Path();
+        p.moveTo(sx, sy);
+        p.lineTo(ex, ey);
+        float dist = (float) Math.hypot(ex - sx, ey - sy);
+        // Подбираем амплитуду микро-удержания так, чтобы PathMeasure выделил ~35% времени на фиксацию в (ex, ey)
+        float step = Math.max(2.0f, Math.min(4.5f, (dist * 0.35f) / Math.max(1, holdLoops * 2)));
+        for (int i = 0; i < holdLoops; i++) {
+            p.lineTo(ex + step, ey);
+            p.lineTo(ex - step, ey);
+        }
+        p.lineTo(ex, ey);
+        return p;
+    }
+
+    // Находит реальное положение летящей фигуры на экране путем сравнения с кадром до начала хода
+    private RectF detectFloatingPiece(Bitmap beforeBmp, Bitmap liveBmp, Piece piece, float cellSize) {
+        int topLimit = (int) (screenH * 0.14f);
+        int bottomLimit = (int) (screenH * 0.67f);
+        int leftLimit = (int) (screenW * 0.02f);
+        int rightLimit = (int) (screenW * 0.98f);
+
+        List<Integer> xs = new ArrayList<>();
+        List<Integer> ys = new ArrayList<>();
+
+        for (int y = topLimit; y <= bottomLimit; y += 5) {
+            for (int x = leftLimit; x <= rightLimit; x += 5) {
+                int cNow = liveBmp.getPixel(x, y);
+                int cBefore = beforeBmp.getPixel(x, y);
+
+                int diff = Math.abs(Color.red(cNow) - Color.red(cBefore))
+                        + Math.abs(Color.green(cNow) - Color.green(cBefore))
+                        + Math.abs(Color.blue(cNow) - Color.blue(cBefore));
+                if (diff < 65) continue;
+
+                float[] hsv = new float[3];
+                Color.colorToHSV(cNow, hsv);
+                // Игнорируем серый кружок касания пальца (у него низкая насыщенность) и берем только яркие блоки фигуры
+                if (hsv[1] > 0.42f && hsv[2] > 0.55f) {
+                    xs.add(x);
+                    ys.add(y);
+                }
             }
+        }
 
-            @Override
-            public void onCancelled(GestureDescription gestureDescription) {
-                onDone.run();
-            }
-        }, null);
+        if (xs.size() < 12) return null;
+        Collections.sort(xs);
+        Collections.sort(ys);
+
+        // Берем 10%..90% квантили для защиты от случайных бликов
+        int minX = xs.get((int) (xs.size() * 0.08f));
+        int maxX = xs.get((int) (xs.size() * 0.92f));
+        int minY = ys.get((int) (ys.size() * 0.08f));
+        int maxY = ys.get((int) (ys.size() * 0.92f));
+
+        float cx = (minX + maxX) / 2.0f;
+        float cy = (minY + maxY) / 2.0f;
+        float halfW = (piece.cols * cellSize) / 2.0f;
+        float halfH = (piece.rows * cellSize) / 2.0f;
+
+        return new RectF(cx - halfW, cy - halfH, cx + halfW, cy + halfH);
+    }
+
+    // Прозрачный прицел поверх экрана (Зеленый = куда ставим, Желтый = где бот видит фигуру)
+    private static class SightOverlayView extends View {
+        private final Paint targetPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint detectedPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint fingerPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private RectF targetRect;
+        private RectF detectedRect;
+        private float fingerX, fingerY;
+
+        public SightOverlayView(Context context) {
+            super(context);
+            targetPaint.setStyle(Paint.Style.STROKE);
+            targetPaint.setStrokeWidth(5f);
+            targetPaint.setColor(Color.parseColor("#00E676")); // Ярко-зеленый
+
+            detectedPaint.setStyle(Paint.Style.STROKE);
+            detectedPaint.setStrokeWidth(5f);
+            detectedPaint.setColor(Color.parseColor("#FFEA00")); // Ярко-желтый
+
+            fingerPaint.setStyle(Paint.Style.FILL);
+            fingerPaint.setColor(Color.parseColor("#FF1744")); // Красная точка пальца
+        }
+
+        public void showSight(RectF target, RectF detected, float fx, float fy) {
+            this.targetRect = target;
+            this.detectedRect = detected;
+            this.fingerX = fx;
+            this.fingerY = fy;
+            postInvalidate();
+        }
+
+        public void clearSight() {
+            this.targetRect = null;
+            this.detectedRect = null;
+            postInvalidate();
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            if (targetRect != null) canvas.drawRect(targetRect, targetPaint);
+            if (detectedRect != null) canvas.drawRect(detectedRect, detectedPaint);
+            if (targetRect != null) canvas.drawCircle(fingerX, fingerY, 10f, fingerPaint);
+        }
     }
 
     private boolean isFilledBoardCell(int color) {
@@ -337,7 +709,6 @@ public class BotAccessibilityService extends AccessibilityService {
         int minY = Integer.MAX_VALUE, maxY = Integer.MIN_VALUE;
         int count = 0;
 
-        // Шаг 2 пикселя для точного захвата даже одиночных кубиков 1x1 и диагоналей
         for (int y = (int) cy - halfW; y <= (int) cy + halfW; y += 2) {
             for (int x = (int) cx - halfW; x <= (int) cx + halfW; x += 2) {
                 if (x < 0 || x >= screenW || y < 0 || y >= screenH) continue;

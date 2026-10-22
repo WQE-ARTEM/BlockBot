@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -17,6 +19,17 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
+
+      - name: Ensure persistent keystore for seamless APK updates
+        run: |
+          if [ ! -f app/bot.keystore ]; then
+            keytool -genkey -v -keystore app/bot.keystore -alias blockbot -keyalg RSA -keysize 2048 -validity 10000 -storepass blockbot123 -keypass blockbot123 -dname "CN=BlockBot, OU=AI, O=Bot, L=City, S=State, C=US"
+            git config user.name "github-actions"
+            git config user.email "actions@github.com"
+            git add app/bot.keystore
+            git commit -m "Add persistent keystore for in-place APK updates" || true
+            git push || true
+          fi
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
