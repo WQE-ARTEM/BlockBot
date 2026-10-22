@@ -20,6 +20,7 @@ import android.view.accessibility.AccessibilityEvent;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -42,8 +43,12 @@ public class BotAccessibilityService extends AccessibilityService {
     private boolean isRunning = false;
     private final Handler handler = new Handler(Looper.getMainLooper());
 
-    private float liftCells = 2.65f;
-    private float dragScale = 1.28f;
+    // Точная калибровка по видео:
+    // 1) При касании фигура подскакивает вверх на 3.10 клетки
+    // 2) По вертикали коэффициент смещения 1.12, по горизонтали (для боковых слотов) — 1.35
+    private float liftCells = 3.10f;
+    private float dragScaleY = 1.12f;
+    private float dragScaleX = 1.35f;
 
     @Override
     protected void onServiceConnected() {
@@ -57,6 +62,7 @@ public class BotAccessibilityService extends AccessibilityService {
     }
 
     public void initProjection(MediaProjection mp) {
+        stopProjection();
         this.projection = mp;
         imageReader = ImageReader.newInstance(screenW, screenH, PixelFormat.RGBA_8888, 2);
         virtualDisplay = projection.createVirtualDisplay("BlockBotDisplay",
@@ -66,19 +72,61 @@ public class BotAccessibilityService extends AccessibilityService {
         showOverlay();
     }
 
+    private void stopProjection() {
+        isRunning = false;
+        handler.removeCallbacksAndMessages(null);
+        if (virtualDisplay != null) {
+            virtualDisplay.release();
+            virtualDisplay = null;
+        }
+        if (imageReader != null) {
+            imageReader.close();
+            imageReader = null;
+        }
+        if (projection != null) {
+            projection.stop();
+            projection = null;
+        }
+    }
+
+    private void closeOverlayAndStop() {
+        stopProjection();
+        if (overlayView != null && wm != null) {
+            try {
+                wm.removeView(overlayView);
+            } catch (Exception ignored) {}
+            overlayView = null;
+        }
+        Toast.makeText(this, "BlockBot закрыт", Toast.LENGTH_SHORT).show();
+    }
+
+    private Button makeSmallBtn(String label, int bgColor) {
+        Button b = new Button(this);
+        b.setText(label);
+        b.setTextColor(Color.WHITE);
+        b.setTextSize(12);
+        b.setPadding(18, 8, 18, 8);
+        b.setMinimumWidth(0);
+        b.setMinWidth(0);
+        b.setBackgroundColor(bgColor);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(6, 0, 6, 0);
+        b.setLayoutParams(lp);
+        return b;
+    }
+
     private void showOverlay() {
         if (overlayView != null) return;
 
         overlayView = new LinearLayout(this);
         overlayView.setOrientation(LinearLayout.HORIZONTAL);
-        overlayView.setBackgroundColor(Color.argb(215, 20, 25, 45));
-        overlayView.setPadding(16, 10, 16, 10);
+        overlayView.setBackgroundColor(Color.argb(220, 20, 25, 45));
+        overlayView.setPadding(12, 8, 12, 8);
         overlayView.setGravity(Gravity.CENTER_VERTICAL);
 
-        toggleBtn = new Button(this);
-        toggleBtn.setText("СТАРТ");
-        toggleBtn.setTextColor(Color.WHITE);
-        toggleBtn.setBackgroundColor(Color.parseColor("#2E7D32"));
+        toggleBtn = makeSmallBtn("СТАРТ", Color.parseColor("#2E7D32"));
         toggleBtn.setOnClickListener(v -> {
             isRunning = !isRunning;
             toggleBtn.setText(isRunning ? "СТОП" : "СТАРТ");
@@ -87,27 +135,45 @@ public class BotAccessibilityService extends AccessibilityService {
         });
         overlayView.addView(toggleBtn);
 
-        Button btnMinus = new Button(this);
-        btnMinus.setText("Y-");
-        btnMinus.setOnClickListener(v -> {
-            liftCells -= 0.15f;
+        Button btnYMinus = makeSmallBtn("Y-", Color.parseColor("#455A64"));
+        btnYMinus.setOnClickListener(v -> {
+            liftCells -= 0.12f;
             statusText.setText(String.format("Y:%.2f", liftCells));
         });
-        overlayView.addView(btnMinus);
+        overlayView.addView(btnYMinus);
 
-        Button btnPlus = new Button(this);
-        btnPlus.setText("Y+");
-        btnPlus.setOnClickListener(v -> {
-            liftCells += 0.15f;
+        Button btnYPlus = makeSmallBtn("Y+", Color.parseColor("#455A64"));
+        btnYPlus.setOnClickListener(v -> {
+            liftCells += 0.12f;
             statusText.setText(String.format("Y:%.2f", liftCells));
         });
-        overlayView.addView(btnPlus);
+        overlayView.addView(btnYPlus);
+
+        Button btnXMinus = makeSmallBtn("X-", Color.parseColor("#37474F"));
+        btnXMinus.setOnClickListener(v -> {
+            dragScaleX -= 0.05f;
+            statusText.setText(String.format("X:%.2f", dragScaleX));
+        });
+        overlayView.addView(btnXMinus);
+
+        Button btnXPlus = makeSmallBtn("X+", Color.parseColor("#37474F"));
+        btnXPlus.setOnClickListener(v -> {
+            dragScaleX += 0.05f;
+            statusText.setText(String.format("X:%.2f", dragScaleX));
+        });
+        overlayView.addView(btnXPlus);
 
         statusText = new TextView(this);
         statusText.setText(" Готов ");
         statusText.setTextColor(Color.WHITE);
-        statusText.setPadding(12, 0, 12, 0);
+        statusText.setTextSize(11);
+        statusText.setPadding(8, 0, 8, 0);
         overlayView.addView(statusText);
+
+        // Кнопка ЗАКРЫТЬ (X)
+        Button btnClose = makeSmallBtn("✕", Color.parseColor("#B71C1C"));
+        btnClose.setOnClickListener(v -> closeOverlayAndStop());
+        overlayView.addView(btnClose);
 
         WindowManager.LayoutParams params = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
@@ -116,7 +182,7 @@ public class BotAccessibilityService extends AccessibilityService {
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
                 PixelFormat.TRANSLUCENT);
         params.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
-        params.y = 80;
+        params.y = 75;
 
         wm.addView(overlayView, params);
     }
@@ -160,7 +226,7 @@ public class BotAccessibilityService extends AccessibilityService {
             bmp.recycle();
 
             if (pieces.isEmpty()) {
-                statusText.setText("Жду фигуры...");
+                statusText.setText("Жду...");
                 handler.postDelayed(this, 450);
                 return;
             }
@@ -174,23 +240,76 @@ public class BotAccessibilityService extends AccessibilityService {
 
             statusText.setText("#" + (bestMove.piece.slotIndex + 1) +
                     " (" + bestMove.piece.rows + "x" + bestMove.piece.cols + ")" +
-                    " -> [" + (bestMove.row + 1) + "," + (bestMove.col + 1) + "]");
+                    "->[" + (bestMove.row + 1) + "," + (bestMove.col + 1) + "]");
 
+            // Центр целевой позиции фигуры на сетке 8x8
             float targetCenterX = gridLeft + (bestMove.col + bestMove.piece.cols / 2.0f) * cellSize;
             float targetCenterY = gridTop + (bestMove.row + bestMove.piece.rows / 2.0f) * cellSize;
 
+            // Начинаем захват из фактического центра фигуры в слоте
             float startX = bestMove.piece.centerX;
             float startY = bestMove.piece.centerY;
 
+            // Учитываем стартовый подскок фигуры вверх (liftCells) и разные коэффициенты по осям X и Y
             float liftPx = liftCells * cellSize;
-            float endX = startX + (targetCenterX - startX) / dragScale;
-            float endY = startY + (targetCenterY - (startY - liftPx)) / dragScale;
+            float endX = startX + (targetCenterX - startX) / dragScaleX;
+            float endY = startY + (targetCenterY - (startY - liftPx)) / dragScaleY;
 
-            performDrag(startX, startY, endX, endY, () -> {
+            performDragWithHold(startX, startY, endX, endY, () -> {
                 if (isRunning) handler.postDelayed(botLoop, 650);
             });
         }
     };
+
+    // Свайп + фиксация пальца в конечной точке на 130 мс, чтобы фигура долетела по инерции и встала в клетку
+    private void performDragWithHold(float sx, float sy, float ex, float ey, Runnable onDone) {
+        ex = Math.max(25, Math.min(screenW - 25, ex));
+        ey = Math.max(25, Math.min(screenH - 25, ey));
+
+        final float finalEx = ex;
+        final float finalEy = ey;
+
+        Path movePath = new Path();
+        movePath.moveTo(sx, sy);
+        movePath.lineTo(finalEx, finalEy);
+
+        GestureDescription.StrokeDescription moveStroke =
+                new GestureDescription.StrokeDescription(movePath, 0, 360, true);
+
+        GestureDescription.Builder builder = new GestureDescription.Builder();
+        builder.addStroke(moveStroke);
+
+        dispatchGesture(builder.build(), new GestureResultCallback() {
+            @Override
+            public void onCompleted(GestureDescription gestureDescription) {
+                Path holdPath = new Path();
+                holdPath.moveTo(finalEx, finalEy);
+                holdPath.lineTo(finalEx + 0.5f, finalEy + 0.5f);
+
+                GestureDescription.StrokeDescription holdStroke =
+                        moveStroke.continueStroke(holdPath, 0, 130, false);
+
+                GestureDescription.Builder holdBuilder = new GestureDescription.Builder();
+                holdBuilder.addStroke(holdStroke);
+
+                dispatchGesture(holdBuilder.build(), new GestureResultCallback() {
+                    @Override
+                    public void onCompleted(GestureDescription gd) {
+                        onDone.run();
+                    }
+                    @Override
+                    public void onCancelled(GestureDescription gd) {
+                        onDone.run();
+                    }
+                }, null);
+            }
+
+            @Override
+            public void onCancelled(GestureDescription gestureDescription) {
+                onDone.run();
+            }
+        }, null);
+    }
 
     private boolean isFilledBoardCell(int color) {
         int r = Color.red(color), g = Color.green(color), b = Color.blue(color);
@@ -443,28 +562,6 @@ public class BotAccessibilityService extends AccessibilityService {
             }
         }
         return empty * 12.0 + space3x3 * 30.0 + clearLines5 * 8.0 - holes * 22.0;
-    }
-
-    private void performDrag(float sx, float sy, float ex, float ey, Runnable onDone) {
-        ex = Math.max(20, Math.min(screenW - 20, ex));
-        ey = Math.max(20, Math.min(screenH - 20, ey));
-
-        Path path = new Path();
-        path.moveTo(sx, sy);
-        path.lineTo(ex, ey);
-
-        GestureDescription.Builder builder = new GestureDescription.Builder();
-        builder.addStroke(new GestureDescription.StrokeDescription(path, 0, 340));
-        dispatchGesture(builder.build(), new GestureResultCallback() {
-            @Override
-            public void onCompleted(GestureDescription gestureDescription) {
-                onDone.run();
-            }
-            @Override
-            public void onCancelled(GestureDescription gestureDescription) {
-                onDone.run();
-            }
-        }, null);
     }
 
     private Bitmap captureScreen() {
