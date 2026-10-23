@@ -62,14 +62,13 @@ public class BotAccessibilityService extends AccessibilityService {
     private SharedPreferences prefs;
     private ServerSocket localServer;
 
-    // Точные параметры с плавным ведением и полной остановкой пальца перед сбросом
     private float baseLiftCells = 2.38f;
     private float rowHeightLiftFactor = 0.16f;
     private float dragScaleX = 1.48f;
     private float dragScaleY = 1.28f;
     private boolean autoLearnRows = false;
-    private int dragDurationMs = 650;  // Время плавного ведения фигуры
-    private int holdDurationMs = 380;  // Время полной остановки пальца на месте перед отпусканием
+    private int dragDurationMs = 650;
+    private int holdDurationMs = 380;
     private boolean useTwoStageHold = true;
 
     private final float[] rowBiasCells = new float[8];
@@ -276,7 +275,6 @@ public class BotAccessibilityService extends AccessibilityService {
         });
         overlayView.addView(toggleBtn);
 
-        // Кнопка регулировки времени удержания перед отпусканием пальца
         speedBtn = makeSmallBtn("ПАУЗА:" + holdDurationMs, Color.parseColor("#1565C0"));
         speedBtn.setOnClickListener(v -> {
             if (holdDurationMs == 380) {
@@ -426,7 +424,6 @@ public class BotAccessibilityService extends AccessibilityService {
         }
     };
 
-    // Плавный свайп + гарантированная полная остановка пальца в точке сброса перед отпусканием
     private void executeMoveWithFullStop(Bitmap beforeBmp, Move move, RectF targetRect,
                                          float sx, float sy, float ex, float ey, float cellSize,
                                          Runnable onDone) {
@@ -437,7 +434,6 @@ public class BotAccessibilityService extends AccessibilityService {
             sightView.showSight(targetRect, null, clampedEx, clampedEy);
         }
 
-        // Делаем контрольный снимок за 120 мс до отпускания пальца (не прерывая и не задерживая жест!)
         long snapshotTime = dragDurationMs + Math.max(80, holdDurationMs - 120);
         handler.postDelayed(() -> {
             if (!isRunning) return;
@@ -460,16 +456,14 @@ public class BotAccessibilityService extends AccessibilityService {
         }, snapshotTime);
 
         if (useTwoStageHold) {
-            // Заранее готовим оба сегмента жеста, чтобы переключение между ними заняло 0.0 мс
             Path dragPath = new Path();
             dragPath.moveTo(sx, sy);
-            // Плавный разгон и плавное торможение у цели
             dragPath.lineTo(sx + (clampedEx - sx) * 0.85f, sy + (clampedEy - sy) * 0.85f);
             dragPath.lineTo(clampedEx, clampedEy);
 
             Path holdPath = new Path();
             holdPath.moveTo(clampedEx, clampedEy);
-            holdPath.lineTo(clampedEx + 0.4f, clampedEy + 0.4f); // Полная неподвижность 380+ мс
+            holdPath.lineTo(clampedEx + 0.4f, clampedEy + 0.4f);
 
             final GestureDescription.StrokeDescription dragStroke =
                     new GestureDescription.StrokeDescription(dragPath, 0, dragDurationMs, true);
@@ -486,14 +480,12 @@ public class BotAccessibilityService extends AccessibilityService {
             dispatchGesture(dragBuilder.build(), new GestureResultCallback() {
                 @Override
                 public void onCompleted(GestureDescription gd) {
-                    // Мгновенный запуск удержания без единой миллисекунды задержки
                     dispatchGesture(holdGesture, new GestureResultCallback() {
                         @Override
                         public void onCompleted(GestureDescription gd2) {
                             if (sightView != null) sightView.clearSight();
                             onDone.run();
                         }
-
                         @Override
                         public void onCancelled(GestureDescription gd2) {
                             useTwoStageHold = false;
@@ -502,7 +494,6 @@ public class BotAccessibilityService extends AccessibilityService {
                         }
                     }, null);
                 }
-
                 @Override
                 public void onCancelled(GestureDescription gd) {
                     if (sightView != null) sightView.clearSight();
@@ -510,7 +501,6 @@ public class BotAccessibilityService extends AccessibilityService {
                 }
             }, null);
         } else {
-            // Резервный однофазный жест с микро-квадратом 0.8 px (держит палец неподвижно без тряски)
             Path singlePath = buildMicroHoldPath(sx, sy, clampedEx, clampedEy);
             GestureDescription.StrokeDescription stroke =
                     new GestureDescription.StrokeDescription(singlePath, 0, dragDurationMs + holdDurationMs);
@@ -522,7 +512,6 @@ public class BotAccessibilityService extends AccessibilityService {
                     if (sightView != null) sightView.clearSight();
                     onDone.run();
                 }
-
                 @Override
                 public void onCancelled(GestureDescription gd) {
                     if (sightView != null) sightView.clearSight();
@@ -532,14 +521,13 @@ public class BotAccessibilityService extends AccessibilityService {
         }
     }
 
-    // Создает микро-удержание в пределах 0.8 пикселя (для игры палец стоит абсолютно неподвижно)
     private Path buildMicroHoldPath(float sx, float sy, float ex, float ey) {
         Path p = new Path();
         p.moveTo(sx, sy);
         p.lineTo(ex, ey);
         float dist = (float) Math.hypot(ex - sx, ey - sy);
         float holdLengthNeeded = dist * ((float) holdDurationMs / Math.max(200, dragDurationMs));
-        float box = 0.8f; // 0.8 px = 0.007 клетки (полностью неподвижно для Unity)
+        float box = 0.8f;
         int loops = Math.max(10, Math.min(90, (int) (holdLengthNeeded / (box * 4f))));
         for (int i = 0; i < loops; i++) {
             p.lineTo(ex + box, ey);
@@ -550,14 +538,35 @@ public class BotAccessibilityService extends AccessibilityService {
         return p;
     }
 
-    // Точное определение размеров 1..5 без ошибки округления 3x3 в 4x4
     private int classifySpanBlocks(float spanPx) {
         float ratio = spanPx / (float) screenW;
         if (ratio < 0.078f) return 1;
         if (ratio < 0.128f) return 2;
-        if (ratio < 0.178f) return 3; // Любой квадрат/уголок 3x3 (0.145..0.170) всегда строго = 3
+        if (ratio < 0.178f) return 3;
         if (ratio < 0.209f) return 4;
         return 5;
+    }
+
+    // НОВЫЙ БРОНЕБОЙНЫЙ АЛГОРИТМ ДЛЯ ЛЮБЫХ СКИНОВ (Пустые клетки всегда темные, блоки яркие)
+    private boolean isFilledBoardCell(int color) {
+        int r = Color.red(color), g = Color.green(color), b = Color.blue(color);
+        float[] hsv = new float[3];
+        Color.colorToHSV(color, hsv);
+        // Отсекаем любой пустой фон (даже светлые скины). Блоки всегда имеют высокую яркость.
+        return hsv[2] > 0.38f && (r + g + b) > 150;
+    }
+
+    private boolean isPiecePixel(int color, int bgColor) {
+        int r = Color.red(color), g = Color.green(color), b = Color.blue(color);
+        int bgR = Color.red(bgColor), bgG = Color.green(bgColor), bgB = Color.blue(bgColor);
+
+        if (r <= bgR + 12 && g <= bgG + 12 && b <= bgB + 15) return false;
+
+        int diff = Math.abs(r - bgR) + Math.abs(g - bgG) + Math.abs(b - bgB);
+        float[] hsv = new float[3];
+        Color.colorToHSV(color, hsv);
+
+        return diff > 35 && (hsv[1] > 0.35f || hsv[2] > 0.50f);
     }
 
     private Piece parsePieceExact(Bitmap bmp, float cx, float cy, int bgColor, int slotIdx) {
@@ -600,7 +609,8 @@ public class BotAccessibilityService extends AccessibilityService {
                         if (isPiecePixel(bmp.getPixel(px, py), bgColor)) hits++;
                     }
                 }
-                if (hits >= 6) {
+                // Понизили порог до 4 для скинов с толстыми рамками между кубиками
+                if (hits >= 4) {
                     shape[r][c] = 1;
                     filledBlocks++;
                 }
@@ -655,7 +665,6 @@ public class BotAccessibilityService extends AccessibilityService {
         int minY = ys.get((int) (ys.size() * 0.10f));
         int maxY = ys.get((int) (ys.size() * 0.90f));
 
-        // Если светится вся линия из 8 клеток (предпросмотр взрыва линии), игнорируем её
         if ((maxX - minX) > cellSize * 6.2f || (maxY - minY) > cellSize * 6.2f) return null;
 
         float cx = (minX + maxX) / 2.0f;
@@ -709,24 +718,6 @@ public class BotAccessibilityService extends AccessibilityService {
             if (detectedRect != null) canvas.drawRect(detectedRect, detectedPaint);
             if (targetRect != null) canvas.drawCircle(fingerX, fingerY, 10f, fingerPaint);
         }
-    }
-
-    private boolean isFilledBoardCell(int color) {
-        int r = Color.red(color), g = Color.green(color), b = Color.blue(color);
-        return (r + g + b) > 140 || b > 110 || r > 90;
-    }
-
-    private boolean isPiecePixel(int color, int bgColor) {
-        int r = Color.red(color), g = Color.green(color), b = Color.blue(color);
-        int bgR = Color.red(bgColor), bgG = Color.green(bgColor), bgB = Color.blue(bgColor);
-
-        if (r <= bgR + 8 && g <= bgG + 8 && b <= bgB + 12) return false;
-
-        int diff = Math.abs(r - bgR) + Math.abs(g - bgG) + Math.abs(b - bgB);
-        float[] hsv = new float[3];
-        Color.colorToHSV(color, hsv);
-
-        return diff > 45 && (hsv[1] > 0.45f || hsv[2] > 0.62f);
     }
 
     private boolean willClearLine(int[][] board, Piece p, int row, int col) {
