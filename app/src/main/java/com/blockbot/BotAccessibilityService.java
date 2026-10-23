@@ -83,7 +83,15 @@ public class BotAccessibilityService extends AccessibilityService {
         screenW = dm.widthPixels;
         screenH = dm.heightPixels;
         screenDensity = dm.densityDpi;
-        prefs = getSharedPreferences("blockbot_cfg_v3", Context.MODE_PRIVATE);
+        prefs = getSharedPreferences("blockbot_cfg_v4", Context.MODE_PRIVATE);
+        
+        float aspect = (float) screenH / screenW;
+        if (aspect < 1.9f) {
+            baseLiftCells = 3.20f;
+            dragScaleX = 1.30f;
+            dragScaleY = 1.15f;
+        }
+        
         loadSavedConfig();
         startLocalHotUpdateServer();
     }
@@ -108,14 +116,6 @@ public class BotAccessibilityService extends AccessibilityService {
             if (obj.has("resetBias") && obj.getBoolean("resetBias")) {
                 for (int i = 0; i < 8; i++) { rowBiasCells[i] = 0f; colBiasCells[i] = 0f; }
             }
-            if (obj.has("rowBiasCells")) {
-                JSONArray arr = obj.getJSONArray("rowBiasCells");
-                for (int i = 0; i < Math.min(8, arr.length()); i++) rowBiasCells[i] = (float) arr.getDouble(i);
-            }
-            if (obj.has("colBiasCells")) {
-                JSONArray arr = obj.getJSONArray("colBiasCells");
-                for (int i = 0; i < Math.min(8, arr.length()); i++) colBiasCells[i] = (float) arr.getDouble(i);
-            }
             if (save) saveCurrentConfig();
             handler.post(() -> {
                 if (statusText != null) statusText.setText("CFG OK!");
@@ -134,14 +134,6 @@ public class BotAccessibilityService extends AccessibilityService {
             obj.put("dragDurationMs", dragDurationMs);
             obj.put("holdDurationMs", holdDurationMs);
             obj.put("useTwoStageHold", useTwoStageHold);
-            JSONArray rArr = new JSONArray();
-            JSONArray cArr = new JSONArray();
-            for (int i = 0; i < 8; i++) {
-                rArr.put(rowBiasCells[i]);
-                cArr.put(colBiasCells[i]);
-            }
-            obj.put("rowBiasCells", rArr);
-            obj.put("colBiasCells", cArr);
             prefs.edit().putString("json", obj.toString()).apply();
         } catch (Exception ignored) {}
     }
@@ -294,7 +286,7 @@ public class BotAccessibilityService extends AccessibilityService {
 
         Button btnYMinus = makeSmallBtn("Y-", Color.parseColor("#455A64"));
         btnYMinus.setOnClickListener(v -> {
-            baseLiftCells -= 0.12f;
+            baseLiftCells -= 0.15f;
             saveCurrentConfig();
             statusText.setText(String.format("L:%.2f", baseLiftCells));
         });
@@ -302,7 +294,7 @@ public class BotAccessibilityService extends AccessibilityService {
 
         Button btnYPlus = makeSmallBtn("Y+", Color.parseColor("#455A64"));
         btnYPlus.setOnClickListener(v -> {
-            baseLiftCells += 0.12f;
+            baseLiftCells += 0.15f;
             saveCurrentConfig();
             statusText.setText(String.format("L:%.2f", baseLiftCells));
         });
@@ -343,10 +335,16 @@ public class BotAccessibilityService extends AccessibilityService {
                 return;
             }
 
-            float gridLeft = screenW * 0.046f;
-            float gridWidth = screenW * 0.908f;
+            float aspect = (float) screenH / screenW;
+            float gridWidthRatio = (aspect < 1.9f) ? 0.88f : 0.908f;
+            float gridTopRatio = (aspect < 1.9f) ? 0.17f : 0.232f;
+            float slotYRatio = (aspect < 1.9f) ? 0.85f : 0.754f;
+            float bgSampleYRatio = (aspect < 1.9f) ? 0.76f : 0.675f;
+
+            float gridWidth = screenW * gridWidthRatio;
+            float gridLeft = (screenW - gridWidth) / 2.0f;
             float cellSize = gridWidth / 8.0f;
-            float gridTop = screenH * 0.232f;
+            float gridTop = screenH * gridTopRatio;
 
             int[][] board = new int[8][8];
             for (int r = 0; r < 8; r++) {
@@ -365,8 +363,8 @@ public class BotAccessibilityService extends AccessibilityService {
             }
 
             float[] slotX = { screenW * 0.208f, screenW * 0.500f, screenW * 0.792f };
-            float slotY = screenH * 0.754f;
-            int bgSample = beforeBmp.getPixel((int) (screenW * 0.5f), (int) (screenH * 0.675f));
+            float slotY = screenH * slotYRatio;
+            int bgSample = beforeBmp.getPixel((int) (screenW * 0.5f), (int) (screenH * bgSampleYRatio));
 
             List<Piece> pieces = new ArrayList<>();
             for (int i = 0; i < 3; i++) {
@@ -417,7 +415,7 @@ public class BotAccessibilityService extends AccessibilityService {
             boolean clearsLine = willClearLine(board, bestMove.piece, bestMove.row, bestMove.col);
             long nextDelay = clearsLine ? 1300L : 750L;
 
-            executeMoveWithFullStop(beforeBmp, bestMove, targetRect, startX, startY, endX, endY, cellSize, () -> {
+            executeMoveWithFullStop(beforeBmp, bestMove, targetRect, startX, startY, endX, endY, cellSize, gridTop, gridWidth, () -> {
                 beforeBmp.recycle();
                 if (isRunning) handler.postDelayed(botLoop, nextDelay);
             });
@@ -425,7 +423,7 @@ public class BotAccessibilityService extends AccessibilityService {
     };
 
     private void executeMoveWithFullStop(Bitmap beforeBmp, Move move, RectF targetRect,
-                                         float sx, float sy, float ex, float ey, float cellSize,
+                                         float sx, float sy, float ex, float ey, float cellSize, float gridTop, float gridWidth,
                                          Runnable onDone) {
         final float clampedEx = Math.max(25, Math.min(screenW - 25, ex));
         final float clampedEy = Math.max(25, Math.min(screenH - 25, ey));
@@ -439,18 +437,10 @@ public class BotAccessibilityService extends AccessibilityService {
             if (!isRunning) return;
             Bitmap liveBmp = captureScreen();
             if (liveBmp != null) {
-                RectF detected = detectFloatingPiece(beforeBmp, liveBmp, move.piece, cellSize);
+                RectF detected = detectFloatingPiece(beforeBmp, liveBmp, move.piece, cellSize, gridTop, gridWidth);
                 liveBmp.recycle();
                 if (detected != null && sightView != null) {
                     sightView.showSight(targetRect, detected, clampedEx, clampedEy);
-                    if (autoLearnRows) {
-                        float errY = targetRect.centerY() - detected.centerY();
-                        if (Math.abs(errY) < cellSize * 2.5f) {
-                            rowBiasCells[move.row] -= (errY / cellSize) * 0.35f;
-                            rowBiasCells[move.row] = Math.max(-2.0f, Math.min(2.0f, rowBiasCells[move.row]));
-                            saveCurrentConfig();
-                        }
-                    }
                 }
             }
         }, snapshotTime);
@@ -547,12 +537,10 @@ public class BotAccessibilityService extends AccessibilityService {
         return 5;
     }
 
-    // НОВЫЙ БРОНЕБОЙНЫЙ АЛГОРИТМ ДЛЯ ЛЮБЫХ СКИНОВ (Пустые клетки всегда темные, блоки яркие)
     private boolean isFilledBoardCell(int color) {
         int r = Color.red(color), g = Color.green(color), b = Color.blue(color);
         float[] hsv = new float[3];
         Color.colorToHSV(color, hsv);
-        // Отсекаем любой пустой фон (даже светлые скины). Блоки всегда имеют высокую яркость.
         return hsv[2] > 0.38f && (r + g + b) > 150;
     }
 
@@ -609,7 +597,6 @@ public class BotAccessibilityService extends AccessibilityService {
                         if (isPiecePixel(bmp.getPixel(px, py), bgColor)) hits++;
                     }
                 }
-                // Понизили порог до 4 для скинов с толстыми рамками между кубиками
                 if (hits >= 4) {
                     shape[r][c] = 1;
                     filledBlocks++;
@@ -628,11 +615,11 @@ public class BotAccessibilityService extends AccessibilityService {
         return p;
     }
 
-    private RectF detectFloatingPiece(Bitmap beforeBmp, Bitmap liveBmp, Piece piece, float cellSize) {
-        int topLimit = (int) (screenH * 0.16f);
-        int bottomLimit = (int) (screenH * 0.66f);
-        int leftLimit = (int) (screenW * 0.03f);
-        int rightLimit = (int) (screenW * 0.97f);
+    private RectF detectFloatingPiece(Bitmap beforeBmp, Bitmap liveBmp, Piece piece, float cellSize, float gridTop, float gridWidth) {
+        int topLimit = Math.max(0, (int) (gridTop - cellSize * 2.0f));
+        int bottomLimit = Math.min(screenH - 1, (int) (gridTop + gridWidth + cellSize * 2.5f));
+        int leftLimit = (int) (screenW * 0.02f);
+        int rightLimit = (int) (screenW * 0.98f);
 
         List<Integer> xs = new ArrayList<>();
         List<Integer> ys = new ArrayList<>();
